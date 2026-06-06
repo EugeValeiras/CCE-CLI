@@ -94,6 +94,22 @@ export interface AutomationAction {
   alarmAction?: 'arm' | 'disarm' | 'toggle';
 }
 
+export interface Scene {
+  id: string;
+  name: string;
+  icon?: string;
+  lights: { lightId: string; on: boolean; bri: number; hue?: number; sat?: number; ct?: number }[];
+  planId?: string;
+}
+
+export interface LightGroup {
+  id: string;
+  name: string;
+  lightIds: string[];
+  icon?: string;
+  planId?: string;
+}
+
 export interface LightBroadcast {
   lightId: string;
   state: Partial<DeviceState>;

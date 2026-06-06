@@ -6,6 +6,10 @@ import { registerAutomationsCommand } from '../commands/automations.js';
 import { registerConfigCommand } from '../commands/config.js';
 import { registerEventsCommand } from '../commands/events.js';
 import { registerHueCommand } from '../commands/hue.js';
+import { registerAlarmCommand } from '../commands/alarm.js';
+import { registerScenesCommand } from '../commands/scenes.js';
+import { registerGroupsCommand } from '../commands/groups.js';
+import { registerNotifyCommand } from '../commands/notify.js';
 
 const program = new Command();
 
@@ -19,6 +23,10 @@ program
 registerDevicesCommand(program);
 registerScanCommand(program);
 registerHueCommand(program);
+registerAlarmCommand(program);
+registerScenesCommand(program);
+registerGroupsCommand(program);
+registerNotifyCommand(program);
 registerAutomationsCommand(program);
 registerConfigCommand(program);
 registerEventsCommand(program);
