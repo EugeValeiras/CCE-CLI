@@ -10,6 +10,7 @@ import { registerAlarmCommand } from '../commands/alarm.js';
 import { registerScenesCommand } from '../commands/scenes.js';
 import { registerGroupsCommand } from '../commands/groups.js';
 import { registerNotifyCommand } from '../commands/notify.js';
+import { registerJblCommand } from '../commands/jbl.js';
 
 const program = new Command();
 
@@ -27,6 +28,7 @@ registerAlarmCommand(program);
 registerScenesCommand(program);
 registerGroupsCommand(program);
 registerNotifyCommand(program);
+registerJblCommand(program);
 registerAutomationsCommand(program);
 registerConfigCommand(program);
 registerEventsCommand(program);
