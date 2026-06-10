@@ -82,7 +82,7 @@ export interface Automation {
 
 export interface AutomationAction {
   lightId: string;
-  on: boolean | 'toggle' | 'bri_up' | 'bri_down' | 'notification' | 'alarm';
+  on: boolean | 'toggle' | 'bri_up' | 'bri_down' | 'notification' | 'alarm' | 'jbl';
   bri?: number;
   briDelta?: number;
   hue?: number;
@@ -92,6 +92,16 @@ export interface AutomationAction {
   notificationSound?: 'alarm' | 'doorbell' | 'alert';
   notificationType?: 'critical' | 'alert' | 'info';
   alarmAction?: 'arm' | 'disarm' | 'toggle';
+  /** Para on === 'jbl' (sentinel '__jbl__'): prender/apagar la soundbar. Default 'on'. */
+  jblAction?: 'on' | 'off';
+  /**
+   * Solo con jblAction 'on'. AUSENTE = 'resume' (compat con acciones ya guardadas):
+   * 'resume' reanuda la última cola sintonizada; 'plain' prende sin reanudar
+   * (solo tecla de power); 'radio' reproduce la radio guardada jblRadioName.
+   */
+  jblOnMode?: 'resume' | 'plain' | 'radio';
+  /** Requerido cuando jblOnMode === 'radio': nombre de una radio guardada (GET /api/jbl/radios). */
+  jblRadioName?: string;
 }
 
 export interface Scene {

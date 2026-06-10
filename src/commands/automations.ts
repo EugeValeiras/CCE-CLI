@@ -178,6 +178,21 @@ async function runAction(client: ReturnType<typeof createApiClient>, act: Automa
     info(`(Skipped) action tipo "${act.on}" (requiere ejecución server-side)`);
     return;
   }
+  if (act.on === 'jbl') {
+    // Soundbar: nunca pasa por /devices.
+    const on = act.jblAction !== 'off';
+    if (on && act.jblOnMode === 'radio') {
+      // playRadio ya despierta la barra desde standby; sin tecla de power.
+      await client.post('/jbl/radio/play', { name: act.jblRadioName });
+    } else if (on && act.jblOnMode === 'plain') {
+      // Prender sin reanudar la última cola sintonizada.
+      await client.put('/jbl/power', { on: true, resume: false });
+    } else {
+      // off, o on + resume (modo ausente = resume): setter idempotente.
+      await client.put('/jbl/power', { on });
+    }
+    return;
+  }
   const body: Record<string, unknown> = {};
   if (act.on === 'toggle' || act.on === 'bri_up' || act.on === 'bri_down') {
     body.on = act.on;
