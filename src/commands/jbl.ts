@@ -41,13 +41,13 @@ export function registerJblCommand(program: Command): void {
 
   cmd
     .command('volume <level>')
-    .description('Setear volumen absoluto 0-100 (PUT /jbl/volume)')
+    .description('Setear volumen absoluto 0-33 (escala del display, PUT /jbl/volume)')
     .action(async (level: string) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
       const volume = parseInt(level, 10);
-      if (Number.isNaN(volume) || volume < 0 || volume > 100) {
-        fail('El volumen debe ser un entero entre 0 y 100');
+      if (Number.isNaN(volume) || volume < 0 || volume > 33) {
+        fail('El volumen debe ser un entero entre 0 y 33');
         process.exit(1);
       }
       const spinner = ora(`Seteando volumen a ${volume}...`).start();
