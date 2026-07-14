@@ -1,5 +1,5 @@
 import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
-import { loadConfig, resolveApiUrl } from './user-config.js';
+import { loadConfig, resolveApiToken, resolveApiUrl } from './user-config.js';
 
 export interface ClientOptions {
   apiUrl?: string;
@@ -8,10 +8,14 @@ export interface ClientOptions {
 
 export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
   const baseURL = `${resolveApiUrl(opts.apiUrl).replace(/\/$/, '')}/api`;
+  const apiToken = resolveApiToken();
   const client = axios.create({
     baseURL,
     timeout: opts.timeoutMs ?? 15000,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(apiToken ? { 'X-CCE-Token': apiToken } : {}),
+    },
   });
   client.interceptors.response.use(
     (r) => r,

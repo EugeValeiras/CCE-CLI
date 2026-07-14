@@ -34,7 +34,7 @@ export function registerConfigCommand(program: Command): void {
     .action(() => {
       const g = getGlobals(cmd);
       const fmt = resolveFormat(g.format);
-      printObject(loadConfig(), fmt === 'table' ? 'json' : fmt);
+      printObject(maskToken(loadConfig()), fmt === 'table' ? 'json' : fmt);
     });
 
   cmd
@@ -98,8 +98,13 @@ export function registerConfigCommand(program: Command): void {
       const cfg = loadConfig();
       saveConfig(cfg as UserConfig);
       info(`Config en ${getConfigPath()}`);
-      printObject(cfg, 'json');
+      printObject(maskToken(cfg), 'json');
     });
+}
+
+function maskToken(cfg: UserConfig): UserConfig {
+  if (!cfg.apiToken) return cfg;
+  return { ...cfg, apiToken: `${cfg.apiToken.slice(0, 4)}…` };
 }
 
 function parseValue(v: string): unknown {

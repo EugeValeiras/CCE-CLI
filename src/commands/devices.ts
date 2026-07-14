@@ -115,16 +115,76 @@ export function registerDevicesCommand(program: Command): void {
 
   cmd
     .command('delete <id>')
-    .description('Eliminar dispositivo de su proveedor')
-    .action(async (id: string) => {
+    .description('Eliminar dispositivo. Acepta dev_* canónico (borra todos sus bindings) o un bindingId')
+    .option('--forget', 'Solo sacarlo de la app (ignore-list, reversible); no desemparejar del proveedor')
+    .option('--force', 'Desemparejar aunque comparta nodo Matter con otros dispositivos (peligroso)')
+    .action(async (id: string, opts: { forget?: boolean; force?: boolean }) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
+      const q = new URLSearchParams();
+      if (opts.forget) q.set('decommission', 'false');
+      if (opts.force) q.set('force', 'true');
+      const qs = q.toString() ? `?${q.toString()}` : '';
       const spinner = ora(`Eliminando ${id}...`).start();
       try {
-        const { data } = await client.delete(`/devices/${encodeURIComponent(id)}`);
+        const { data } = await client.delete(`/devices/${encodeURIComponent(id)}${qs}`);
         spinner.stop();
+        const bindings: Array<{ bindingId: string; provider: string; action: string; reason?: string }> =
+          data.bindings ?? [];
+        for (const b of bindings) {
+          const tag =
+            b.action === 'decommissioned' ? 'desemparejado'
+            : b.action === 'forgotten' ? 'olvidado'
+            : 'falló';
+          const reason = b.reason ? ` (${b.reason})` : '';
+          process.stdout.write(`  ${b.provider}:${b.bindingId} → ${tag}${reason}\n`);
+        }
+        if (data.purgedRefs) process.stdout.write(`  refs de config limpiadas: ${data.purgedRefs}\n`);
         if (data.success) success(`Eliminado: ${id}`);
         else fail(`No se pudo eliminar: ${id}`);
+      } catch (e) {
+        spinner.stop();
+        fail((e as Error).message);
+        process.exit(1);
+      }
+    });
+
+  cmd
+    .command('prune')
+    .description('Limpieza masiva de huérfanos. Por defecto dry-run (solo lista)')
+    .option('--scope <scope>', "dead (todos los bindings inalcanzables) | unplaced (sin ubicar en planos) | all", 'dead')
+    .option('--apply', 'Ejecutar de verdad (sin esto, solo lista los candidatos)')
+    .option('--forget', 'Olvidar (ignore-list) en vez de desemparejar del proveedor')
+    .option('--force', 'Desemparejar aunque comparta nodo Matter (peligroso)')
+    .action(async (opts: { scope?: string; apply?: boolean; forget?: boolean; force?: boolean }) => {
+      const g = getGlobals(cmd);
+      const client = createApiClient({ apiUrl: g.apiUrl });
+      const dryRun = !opts.apply;
+      const spinner = ora(dryRun ? 'Buscando huérfanos...' : 'Limpiando...').start();
+      try {
+        const { data } = await client.post('/devices/prune', {
+          scope: opts.scope,
+          dryRun,
+          decommission: !opts.forget,
+          force: !!opts.force,
+        });
+        spinner.stop();
+        const candidates: Array<{ id: string; name: string; type: string; reachable: boolean }> =
+          data.candidates ?? [];
+        if (candidates.length === 0) {
+          success(`Sin candidatos para scope="${data.scope}".`);
+          return;
+        }
+        process.stdout.write(`Candidatos (scope=${data.scope}):\n`);
+        for (const c of candidates) {
+          process.stdout.write(`  ${c.id}  ${c.name}  [${c.type}]  reach=${c.reachable}\n`);
+        }
+        if (dryRun) {
+          process.stdout.write(`\n${candidates.length} dispositivo(s). Corré con --apply para eliminarlos.\n`);
+        } else {
+          const removed: Array<{ removed: boolean }> = data.removed ?? [];
+          success(`Eliminados ${removed.filter((r) => r.removed).length}/${candidates.length}.`);
+        }
       } catch (e) {
         spinner.stop();
         fail((e as Error).message);

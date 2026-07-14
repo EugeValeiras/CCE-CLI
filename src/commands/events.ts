@@ -1,20 +1,26 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
+import ora from 'ora';
 import { createSocket } from '../lib/socket-client.js';
-import { fail, info } from '../lib/format.js';
+import { createApiClient } from '../lib/api-client.js';
+import { Column, OutputFormat, fail, info, printRows, warn } from '../lib/format.js';
+import { resolveFormat } from '../lib/user-config.js';
 import {
   AutomationExecutedBroadcast,
   DeviceStateChangedBroadcast,
+  EventRecord,
+  EventsListResponse,
   LightBroadcast,
 } from '../types/api.js';
 
 interface GlobalOpts {
   apiUrl?: string;
-  format?: 'table' | 'json' | 'csv';
+  format?: OutputFormat;
 }
 
 function getGlobals(cmd: Command): GlobalOpts {
-  return cmd.optsWithGlobals<GlobalOpts>();
+  const opts = cmd.optsWithGlobals<GlobalOpts>();
+  return { apiUrl: opts.apiUrl, format: opts.format };
 }
 
 const EVENTS = [
@@ -66,6 +72,108 @@ export function registerEventsCommand(program: Command): void {
         process.exit(0);
       });
     });
+
+  cmd
+    .command('list')
+    .description('Consultar el histórico de eventos persistido (GET /api/events)')
+    .option('--limit <n>', 'Máximo de eventos a traer (1-1000)', parseLimit, 100)
+    .option('--channel <channel>', 'Filtrar por canal: internal | websocket')
+    .option('--event <name>', 'Filtrar por nombre de evento (ej: device.state.changed)')
+    .option('--device <id>', 'Filtrar por globalId del dispositivo')
+    .option('--provider <provider>', 'Filtrar por provider (ej: hue, tuya, matter)')
+    .option('--from <iso>', 'Desde (ISO 8601, ej: 2026-06-18T00:00:00Z)')
+    .option('--to <iso>', 'Hasta (ISO 8601)')
+    .option('--cursor <cursor>', 'Cursor de paginación (nextCursor de una consulta previa)')
+    .option('--all', 'Seguir el cursor y traer todas las páginas')
+    .action(async (opts: ListOpts) => {
+      const g = getGlobals(cmd);
+      const fmt = resolveFormat(g.format);
+      const client = createApiClient({ apiUrl: g.apiUrl });
+
+      if (opts.channel && opts.channel !== 'internal' && opts.channel !== 'websocket') {
+        fail(`--channel inválido: ${opts.channel} (usá internal | websocket)`);
+        process.exit(1);
+      }
+
+      const baseParams: Record<string, string | number> = { limit: opts.limit };
+      if (opts.channel) baseParams.channel = opts.channel;
+      if (opts.event) baseParams.eventName = opts.event;
+      if (opts.device) baseParams.globalId = opts.device;
+      if (opts.provider) baseParams.provider = opts.provider;
+      if (opts.from) baseParams.from = opts.from;
+      if (opts.to) baseParams.to = opts.to;
+
+      const spinner = ora('Consultando eventos...').start();
+      try {
+        const items: EventRecord[] = [];
+        let cursor = opts.cursor;
+        let enabled = true;
+        do {
+          const params = { ...baseParams, ...(cursor ? { cursor } : {}) };
+          const { data } = await client.get<EventsListResponse>('/events', { params });
+          enabled = data.enabled;
+          items.push(...data.items);
+          cursor = data.nextCursor ?? undefined;
+        } while (opts.all && cursor && items.length < HARD_CAP);
+        spinner.stop();
+
+        if (!enabled) {
+          warn('El events-store está deshabilitado en el backend (EVENTS_STORE_ENABLED=false).');
+        }
+        if (opts.all && cursor && items.length >= HARD_CAP) {
+          warn(`Tope de seguridad alcanzado (${HARD_CAP}). Quedaron más eventos sin traer.`);
+        }
+
+        printRows(items, eventColumns, fmt);
+
+        if (!opts.all && cursor && fmt === 'table') {
+          info(`Hay más eventos. Próxima página: --cursor ${cursor}`);
+        }
+      } catch (e) {
+        spinner.stop();
+        fail((e as Error).message);
+        process.exit(1);
+      }
+    });
+}
+
+const HARD_CAP = 10000;
+
+interface ListOpts {
+  limit: number;
+  channel?: string;
+  event?: string;
+  device?: string;
+  provider?: string;
+  from?: string;
+  to?: string;
+  cursor?: string;
+  all?: boolean;
+}
+
+function parseLimit(value: string): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 1000) {
+    fail('--limit debe ser un entero entre 1 y 1000');
+    process.exit(1);
+  }
+  return n;
+}
+
+const eventColumns: Column<EventRecord>[] = [
+  { header: 'Time', get: (e) => new Date(e.time).toLocaleString() },
+  { header: 'Channel', get: (e) => e.channel },
+  { header: 'Event', get: (e) => e.eventName },
+  { header: 'Source', get: (e) => e.source ?? '' },
+  { header: 'Provider', get: (e) => e.provider ?? '' },
+  { header: 'Device', get: (e) => e.globalId ?? '' },
+  { header: 'Payload', get: (e) => summarizePayload(e.payload) },
+];
+
+function summarizePayload(payload: EventRecord['payload']): string {
+  if (payload === null || payload === undefined) return '';
+  const json = JSON.stringify(payload);
+  return json.length > 80 ? `${json.slice(0, 77)}...` : json;
 }
 
 function matchesDevice(event: string, payload: unknown, id: string): boolean {

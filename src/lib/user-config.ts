@@ -4,6 +4,7 @@ import * as os from 'os';
 
 export interface UserConfig {
   apiUrl: string;
+  apiToken?: string;
   outputFormat: 'table' | 'json' | 'csv';
   providers: {
     hue?: { bridgeIp: string; apiKey: string };
@@ -50,6 +51,10 @@ export function saveConfig(cfg: UserConfig): void {
 
 export function resolveApiUrl(flagUrl?: string): string {
   return flagUrl ?? process.env.CCE_API_URL ?? loadConfig().apiUrl;
+}
+
+export function resolveApiToken(flagToken?: string): string | undefined {
+  return flagToken ?? process.env.CCE_API_TOKEN ?? loadConfig().apiToken;
 }
 
 export function resolveFormat(flagFormat?: string): 'table' | 'json' | 'csv' {

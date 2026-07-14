@@ -142,3 +142,22 @@ export interface AutomationExecutedBroadcast {
   sensorId?: string;
   timestamp: number;
 }
+
+export type EventChannel = 'internal' | 'websocket';
+
+export interface EventRecord {
+  time: string;
+  id: string;
+  channel: EventChannel;
+  eventName: string;
+  source: string | null;
+  globalId: string | null;
+  provider: string | null;
+  payload: Record<string, unknown> | unknown[] | null;
+}
+
+export interface EventsListResponse {
+  items: EventRecord[];
+  nextCursor: string | null;
+  enabled: boolean;
+}
