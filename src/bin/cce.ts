@@ -11,6 +11,7 @@ import { registerScenesCommand } from '../commands/scenes.js';
 import { registerGroupsCommand } from '../commands/groups.js';
 import { registerNotifyCommand } from '../commands/notify.js';
 import { registerJblCommand } from '../commands/jbl.js';
+import { registerTvCommand } from '../commands/tv.js';
 
 const program = new Command();
 
@@ -29,6 +30,7 @@ registerScenesCommand(program);
 registerGroupsCommand(program);
 registerNotifyCommand(program);
 registerJblCommand(program);
+registerTvCommand(program);
 registerAutomationsCommand(program);
 registerConfigCommand(program);
 registerEventsCommand(program);
