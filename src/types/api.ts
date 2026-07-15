@@ -104,11 +104,24 @@ export interface AutomationAction {
   jblRadioName?: string;
 }
 
+/**
+ * F14 — entry heterogénea ("modo cine"): un device (deviceId) con O `state`
+ * (on/bri/...) O `action` de catálogo ({verb,args}). Se ejecuta server-side vía
+ * POST /config/scenes/:id/run junto con lights[]. Read-both: escenas viejas
+ * solo-lights siguen igual.
+ */
+export interface SceneEntry {
+  deviceId: string;
+  state?: { on?: boolean; bri?: number; hue?: number; sat?: number; ct?: number };
+  action?: { verb: string; args?: Record<string, unknown> };
+}
+
 export interface Scene {
   id: string;
   name: string;
   icon?: string;
-  lights: { lightId: string; on: boolean; bri: number; hue?: number; sat?: number; ct?: number }[];
+  lights?: { lightId: string; on: boolean; bri: number; hue?: number; sat?: number; ct?: number }[];
+  entries?: SceneEntry[];
   planId?: string;
 }
 

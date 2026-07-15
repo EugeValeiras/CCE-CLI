@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import ora from 'ora';
 import { createApiClient } from '../lib/api-client.js';
-import { Column, fail, printObject, printRows, success, warn, OutputFormat } from '../lib/format.js';
+import { Column, fail, printObject, printRows, success, OutputFormat } from '../lib/format.js';
 import { resolveFormat } from '../lib/user-config.js';
 import { Scene } from '../types/api.js';
 
@@ -47,41 +47,20 @@ export function registerScenesCommand(program: Command): void {
 
   cmd
     .command('activate <id>')
-    .description('Activar una escena: aplica el estado a cada luz')
+    .description('Activar una escena SERVER-SIDE (luces + entries del "modo cine": TV/HDMI/JBL)')
     .action(async (id: string) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
       const spinner = ora('Activando escena...').start();
       try {
-        const { data } = await client.get<{ scenes: Scene[] }>('/config/scenes');
-        const scene = (data.scenes ?? []).find((s) => s.id === id);
-        if (!scene) {
-          spinner.stop();
-          fail(`Escena no encontrada: ${id}`);
-          process.exit(1);
-        }
-        let ok = 0;
-        const failures: string[] = [];
-        for (const light of scene.lights) {
-          try {
-            await client.put(`/devices/${encodeURIComponent(light.lightId)}/state`, {
-              on: light.on,
-              bri: light.bri,
-              ...(light.hue != null ? { hue: light.hue } : {}),
-              ...(light.sat != null ? { sat: light.sat } : {}),
-              ...(light.ct != null ? { ct: light.ct } : {}),
-            });
-            ok++;
-          } catch (e) {
-            failures.push(`${light.lightId}: ${(e as Error).message}`);
-          }
-        }
+        // F14: el server corre lights[] + entries[] de una sola pasada y pasa
+        // por el chokepoint sensitive (un verbo 'unlock' en una entry nunca se
+        // ejecuta). Antes el CLI iteraba client-side scene.lights, con lo que
+        // el "modo cine" (TV/HDMI2/JBL) nunca se disparaba. Read-both: escenas
+        // viejas solo-lights corren igual (executeScene ejecuta lights[]).
+        await client.post(`/config/scenes/${encodeURIComponent(id)}/run`, {});
         spinner.stop();
-        success(`Escena activada: ${ok} luces`);
-        if (failures.length > 0) {
-          warn(`${failures.length} luces fallaron:`);
-          for (const f of failures) warn(`  ${f}`);
-        }
+        success(`Escena activada: ${id}`);
       } catch (e) {
         spinner.stop();
         fail((e as Error).message);
