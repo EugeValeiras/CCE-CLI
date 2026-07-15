@@ -229,6 +229,54 @@ export function registerDevicesCommand(program: Command): void {
     });
 
   cmd
+    .command('action <id> <verb> [args...]')
+    .description(
+      'Ejecutar una acción genérica por capability: setVolume volume=15, mute muted=true, ' +
+        'setInput source=HDMI2, launchApp appId=netflix, setChannel channel:=7, ' +
+        'volumeUp, play/pause/stop/next/prev, lock/unlock (--confirm). ' +
+        'Usá key:=value para forzar string (ej. un canal numérico: channel:=7).',
+    )
+    .option('--confirm', 'Confirmar un verbo sensible (ej. unlock)')
+    .action(async (id: string, verb: string, args: string[], opts: { confirm?: boolean }) => {
+      const g = getGlobals(cmd);
+      const fmt = resolveFormat(g.format);
+      const client = createApiClient({ apiUrl: g.apiUrl });
+      // Parseo key=value con coerción de tipo: el catálogo valida TIPO
+      // (number/boolean/string), así que un volume='15' string daría 400.
+      // Sintaxis explícita key:=value → fuerza string SIN coerción, para args
+      // string-typed con valor numérico (ej. setChannel channel:=7): sin esto
+      // coerceArg('7') mandaría {channel:7} y el catálogo lo rechaza con 400.
+      const body: Record<string, unknown> = {};
+      for (const raw of args ?? []) {
+        const eq = raw.indexOf('=');
+        if (eq === -1) {
+          fail(`Argumento inválido '${raw}': usá formato key=value (ej. volume=15) o key:=value para forzar string.`);
+          process.exit(1);
+        }
+        if (eq > 0 && raw[eq - 1] === ':') {
+          body[raw.slice(0, eq - 1)] = raw.slice(eq + 1);
+        } else {
+          body[raw.slice(0, eq)] = coerceArg(raw.slice(eq + 1));
+        }
+      }
+      if (opts.confirm) body.confirm = true;
+      const spinner = ora(`Ejecutando ${verb} en ${id}...`).start();
+      try {
+        const { data } = await client.post(
+          `/devices/${encodeURIComponent(id)}/actions/${encodeURIComponent(verb)}`,
+          body,
+        );
+        spinner.stop();
+        success(`${verb} → ${id}`);
+        printObject(data, fmt === 'table' ? 'json' : fmt);
+      } catch (e) {
+        spinner.stop();
+        fail((e as Error).message);
+        process.exit(1);
+      }
+    });
+
+  cmd
     .command('prefer <id> <bindingId>')
     .description('Establecer binding preferido para comandos')
     .action(async (id: string, bindingId: string) => {
@@ -248,4 +296,12 @@ function parseIntOpt(v: string): number {
   const n = parseInt(v, 10);
   if (Number.isNaN(n)) throw new Error(`Valor entero inválido: ${v}`);
   return n;
+}
+
+/** Coerción para args key=value de `devices action`: number → boolean → string. */
+function coerceArg(v: string): number | boolean | string {
+  if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return v;
 }
