@@ -24,8 +24,13 @@ function getGlobals(cmd: Command): GlobalOpts {
 }
 
 const EVENTS = [
+  // light:changed queda en la lista por si se observa una API vieja; la API
+  // actual ya no lo emite (DUP-5 cerrado 30/07): el canal canónico
+  // device:state-changed trae viaBindingId, y el discovery tiene canal propio.
   'light:changed',
   'device:state-changed',
+  'device:discovered',
+  'device:command-result',
   'automation:executed',
   'alarm:armed-changed',
   'alarm:triggered',
