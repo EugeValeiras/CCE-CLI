@@ -131,6 +131,40 @@ export function registerHueCommand(program: Command): void {
       },
     );
 
+  // Rooms de Hue como target de primera clase (30/07): listar y comandar el
+  // room ENTERO (groupcast nativo del bridge, patch completo server-side).
+  const rooms = cmd.command('rooms').description('Rooms de Hue (groupcast nativo)');
+
+  rooms
+    .command('list')
+    .description('Listar rooms con estado agregado')
+    .action(async () => {
+      const g = getGlobals(cmd);
+      const client = createApiClient({ apiUrl: g.apiUrl });
+      const { data } = await client.get<any[]>('/hue/rooms');
+      for (const r of data) {
+        console.log(`${r.on ? '●' : '○'} ${r.name}  [${r.bridgeName ?? r.bridgeId ?? ''}]  ${r.id}`);
+      }
+    });
+
+  const roomAction = (onValue: boolean) => async (idOrName: string) => {
+    const g = getGlobals(cmd);
+    const client = createApiClient({ apiUrl: g.apiUrl });
+    const { data } = await client.get<any[]>('/hue/rooms');
+    const room =
+      data.find((r) => r.id === idOrName) ??
+      data.find((r) => String(r.name).toLowerCase() === idOrName.toLowerCase());
+    if (!room) {
+      console.error(`Room no encontrado: ${idOrName}`);
+      process.exit(1);
+    }
+    await client.put(`/hue/rooms/${encodeURIComponent(room.id)}/state`, { on: onValue });
+    console.log(`${room.name} → ${onValue ? 'ON' : 'OFF'}`);
+  };
+
+  rooms.command('on <idOrName>').description('Encender el room').action(roomAction(true));
+  rooms.command('off <idOrName>').description('Apagar el room').action(roomAction(false));
+
   cmd
     .command('disconnect')
     .description('Desconectar el bridge Hue del backend (DELETE /api/hue/disconnect)')

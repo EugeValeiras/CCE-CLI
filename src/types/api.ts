@@ -68,9 +68,9 @@ export interface Automation {
   name: string;
   icon: string;
   enabled: boolean;
-  source: 'scene' | 'group' | 'custom';
+  source: 'scene' | 'group' | 'custom' | 'hueScene' | 'hueRoom';
   sourceId?: string;
-  sourceAction?: 'on' | 'off';
+  sourceAction?: 'on' | 'off' | 'toggle';
   mode: 'toggle' | 'full';
   trigger: {
     type: 'manual' | 'schedule' | 'sensor';

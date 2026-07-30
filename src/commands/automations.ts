@@ -76,30 +76,17 @@ export function registerAutomationsCommand(program: Command): void {
 
   cmd
     .command('run <id>')
-    .description('Ejecutar acciones de una automatización manualmente (vía PUT /devices/:id/state)')
+    .description('Ejecutar una automatización (server-side: resuelve TODOS los sources)')
     .action(async (id: string) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
       try {
-        const { data } = await client.get<Automation[]>('/config/automations');
-        const a = data.find((x) => x.id === id);
-        if (!a) {
-          fail(`Automatización no encontrada: ${id}`);
-          process.exit(1);
-        }
-        info(`Ejecutando ${a.actions.length} acciones de "${a.name}"...`);
-        let ok = 0;
-        let errCount = 0;
-        for (const act of a.actions) {
-          try {
-            await runAction(client, act);
-            ok++;
-          } catch (e) {
-            errCount++;
-            fail(`Action lightId=${act.lightId}: ${(e as Error).message}`);
-          }
-        }
-        success(`Hechas ${ok} acciones, ${errCount} fallidas.`);
+        // Server-side a propósito: el run client-side viejo ignoraba el source
+        // (una automation source:group/hueRoom/scene ejecutaba CERO acciones y
+        // reportaba éxito) y las acciones on:'group' caían al path device roto.
+        // El server la corre entera por el chokepoint, con origin en el ledger.
+        await client.post(`/automations/${encodeURIComponent(id)}/run`, {});
+        success(`Automatización ${id} ejecutada (server-side).`);
       } catch (e) {
         fail((e as Error).message);
         process.exit(1);
