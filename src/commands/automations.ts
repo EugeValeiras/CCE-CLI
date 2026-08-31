@@ -2,9 +2,10 @@ import { Command } from 'commander';
 import * as fs from 'fs';
 import ora from 'ora';
 import { createApiClient } from '../lib/api-client.js';
-import { Column, fail, info, printObject, printRows, success } from '../lib/format.js';
+import { Column, fail, printObject, printRows, success } from '../lib/format.js';
 import { resolveFormat } from '../lib/user-config.js';
-import { Automation, AutomationAction } from '../types/api.js';
+import { countSteps, describeTriggers, renderAutomation } from '../lib/flow-format.js';
+import { Automation } from '../types/api.js';
 
 interface GlobalOpts {
   apiUrl?: string;
@@ -15,13 +16,24 @@ function getGlobals(cmd: Command): GlobalOpts {
   return cmd.optsWithGlobals<GlobalOpts>();
 }
 
+/**
+ * CCE#64 — Las columnas describen el modelo de FLUJO.
+ *
+ * `Trigger`/`Actions` mostraban `trigger.type` y `actions.length`, que hablaban
+ * del modelo plano: una automatización con dos sensores decía "sensor" a secas,
+ * y una con ramas o esperas contaba sólo las acciones de primer nivel. Ahora
+ * `Triggers` sale de `when` (con la cantidad cuando hay varios sensores) y
+ * `Steps` cuenta el árbol entero, ramas incluidas.
+ *
+ * `Source` se va: en la casa TODAS las automatizaciones son `custom`, y en el
+ * modelo nuevo el source es una acción más del flujo, no una categoría.
+ */
 const autoCols: Column<Automation>[] = [
   { header: 'ID', get: (a) => a.id },
   { header: 'Name', get: (a) => a.name },
   { header: 'Enabled', get: (a) => a.enabled },
-  { header: 'Source', get: (a) => a.source },
-  { header: 'Trigger', get: (a) => a.trigger?.type ?? '' },
-  { header: 'Actions', get: (a) => a.actions?.length ?? 0 },
+  { header: 'Triggers', get: (a) => describeTriggers(a) },
+  { header: 'Steps', get: (a) => countSteps(a.flow) },
 ];
 
 export function registerAutomationsCommand(program: Command): void {
@@ -57,7 +69,12 @@ export function registerAutomationsCommand(program: Command): void {
           fail(`Automatización no encontrada: ${id}`);
           process.exit(1);
         }
-        printObject(a, fmt === 'table' ? 'json' : fmt);
+        // En `table` (el default) se muestra el FLUJO indentado; el JSON crudo
+        // de un árbol con ramas y esperas no se lee en una terminal. Con
+        // --format json/csv sale el objeto entero, que es lo que espera un
+        // script que canaliza la salida.
+        if (fmt === 'table') console.log(renderAutomation(a));
+        else printObject(a, fmt);
       } catch (e) {
         fail((e as Error).message);
         process.exit(1);
@@ -158,38 +175,4 @@ async function setEnabled(cmd: Command, id: string, enabled: boolean): Promise<v
     fail((e as Error).message);
     process.exit(1);
   }
-}
-
-async function runAction(client: ReturnType<typeof createApiClient>, act: AutomationAction): Promise<void> {
-  if (act.on === 'notification' || act.on === 'alarm') {
-    info(`(Skipped) action tipo "${act.on}" (requiere ejecución server-side)`);
-    return;
-  }
-  if (act.on === 'jbl') {
-    // Soundbar: nunca pasa por /devices.
-    const on = act.jblAction !== 'off';
-    if (on && act.jblOnMode === 'radio') {
-      // playRadio ya despierta la barra desde standby; sin tecla de power.
-      await client.post('/jbl/radio/play', { name: act.jblRadioName });
-    } else if (on && act.jblOnMode === 'plain') {
-      // Prender sin reanudar la última cola sintonizada.
-      await client.put('/jbl/power', { on: true, resume: false });
-    } else {
-      // off, o on + resume (modo ausente = resume): setter idempotente.
-      await client.put('/jbl/power', { on });
-    }
-    return;
-  }
-  const body: Record<string, unknown> = {};
-  if (act.on === 'toggle' || act.on === 'bri_up' || act.on === 'bri_down') {
-    body.on = act.on;
-  } else if (typeof act.on === 'boolean') {
-    body.on = act.on;
-  }
-  if (act.bri !== undefined) body.bri = act.bri;
-  if (act.briDelta !== undefined) body.briDelta = act.briDelta;
-  if (act.hue !== undefined) body.hue = act.hue;
-  if (act.sat !== undefined) body.sat = act.sat;
-  if (act.ct !== undefined) body.ct = act.ct;
-  await client.put(`/devices/${encodeURIComponent(act.lightId)}/state`, body);
 }
