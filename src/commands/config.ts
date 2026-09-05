@@ -1,11 +1,11 @@
 import { Command } from 'commander';
 import { createApiClient } from '../lib/api-client.js';
 import {
-  AutomationInput,
-  derivedFlowWarnings,
+  prepareBulkAutomations,
   readConfigVersion,
   replaceAllAutomations,
 } from '../lib/automations-api.js';
+import { warnIfStateUnknown } from '../lib/state-warning.js';
 import { fail, info, note, printObject, success, warn } from '../lib/format.js';
 import {
   getConfigPath,
@@ -71,17 +71,18 @@ export function registerConfigCommand(program: Command): void {
       const fmt = resolveFormat(g.format);
       const client = createApiClient({ apiUrl: g.apiUrl });
       try {
-        const url = section ? `/config/${section}` : '/config';
+        const wanted = normalizeSection(section);
+        const url = wanted ? `/config/${wanted}` : '/config';
         const { data, headers } = await client.get(url);
         printObject(data, fmt === 'table' ? 'json' : fmt);
         // CCE#107 — la versión de ESTA lectura, que es la que hay que mandar
         // como If-Match si lo que sigue es editar y reescribir el array. Va por
         // stderr para no romper `cce config show automations > f.json`.
-        const version = section ? readConfigVersion(headers as Record<string, unknown>) : undefined;
+        const version = wanted ? readConfigVersion(headers as Record<string, unknown>) : undefined;
         if (version) {
           note(
             `Versión de esta lectura: ${version}. Si vas a reescribir el array entero: ` +
-              `cce config set-remote ${section} --if-match ${version}`,
+              `cce config set-remote ${wanted} --if-match ${version}`,
           );
         }
       } catch (e) {
@@ -101,31 +102,35 @@ export function registerConfigCommand(program: Command): void {
     .action(async (section: string, opts: { ifMatch?: string }) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
+      // CCE#107 — la sección se NORMALIZA antes de decidir nada. Express enruta
+      // case-insensitive y non-strict, así que `Automations` y `automations/`
+      // llegan igual al handler del replace masivo; con la comparación exacta
+      // se iban por el `else` y hacían el PUT sin If-Match — el vector del
+      // incidente, esquivando el único guard que hay.
+      const wanted = normalizeSection(section);
       try {
         const raw = await readStdin();
-        const body = JSON.parse(raw);
-        // CCE#107 — `automations` es la única sección con versionado optimista,
-        // y este comando es el ÚNICO replace masivo que le queda al CLI (las
-        // mutaciones puntuales viven en `cce automations`, item-level). La
-        // versión la trae el usuario desde el `config show` que editó: un
+        const parsed = JSON.parse(raw);
+        // La versión la trae el usuario desde el `config show` que editó: un
         // If-Match tomado de un GET de recién coincide siempre y no protege de
         // nada. Ver `replaceAllAutomations`.
-        if (section === 'automations') {
-          // El mismo no-op silencioso que `cce automations create`, por la otra
-          // puerta: la API descarta flow/when en los items flowDerived y
-          // responde 200 igual. Se avisa ANTES de escribir, porque después el
-          // «✓ actualizada» ya se leyó como que la edición entró.
-          for (const w of derivedFlowWarnings(asAutomationList(body))) warn(w);
+        if (wanted === 'automations') {
+          // Igual que `cce automations create`: el flujo derivado se quita del
+          // envío (la API lo descarta) en vez de mandarlo y hacer creer que se
+          // guardó.
+          const { body, warnings } = prepareBulkAutomations(parsed);
+          for (const w of warnings) warn(w);
           await replaceAllAutomations(client, body, opts.ifMatch ?? '');
         } else {
           if (opts.ifMatch) {
-            warn(`--if-match se ignora en /${section}: sólo automations tiene versionado.`);
+            warn(`--if-match se ignora en /${wanted}: sólo automations tiene versionado.`);
           }
-          await client.put(`/config/${section}`, body);
+          await client.put(`/config/${wanted}`, parsed);
         }
-        success(`Config remota /${section} actualizada.`);
+        success(`Config remota /${wanted} actualizada.`);
       } catch (e) {
         fail((e as Error).message);
+        warnIfStateUnknown(e, `la escritura de /${wanted}`);
         process.exitCode = 1;
       }
     });
@@ -141,10 +146,16 @@ export function registerConfigCommand(program: Command): void {
     });
 }
 
-/** El body de `set-remote automations`, si tiene forma de lista de automatizaciones. */
-function asAutomationList(body: unknown): AutomationInput[] {
-  if (!Array.isArray(body)) return [];
-  return body.filter((a): a is AutomationInput => typeof a === 'object' && a !== null);
+/**
+ * La sección tal como la va a resolver el router de la API.
+ *
+ * Express matchea sin distinguir mayúsculas y tolerando la barra final, así que
+ * `Automations`, `automations/` y `automations` son la MISMA ruta del lado del
+ * servidor. Si el CLI no normaliza, dos de las tres se saltean el tratamiento
+ * especial de automations (If-Match y flujo derivado) y escriben igual.
+ */
+function normalizeSection(section?: string): string {
+  return (section ?? '').trim().toLowerCase().replace(/^\/+|\/+$/g, '');
 }
 
 function maskToken(cfg: UserConfig): UserConfig {

@@ -43,6 +43,31 @@ interface Reply {
   body: unknown;
 }
 
+/**
+ * Las claves que los DTOs declaran. Todo lo demás lo borra `whitelist: true`
+ * (`automation.dto.ts` + `main.ts`).
+ */
+const DECLARED_KEYS = new Set([
+  'id',
+  'name',
+  'icon',
+  'enabled',
+  'source',
+  'sourceId',
+  'sourceAction',
+  'sourceSmart',
+  'mode',
+  'trigger',
+  'actions',
+  'when',
+  'flow',
+  'flowDerived',
+  'flowLayout',
+  'onRetrigger',
+  'planId',
+  'planIds',
+]);
+
 const nest = (status: number, message: string | string[], error: string): Reply => ({
   status,
   body: { message, error, statusCode: status },
@@ -62,13 +87,36 @@ export class FakeCceApi {
     this.version = version;
   }
 
+  /**
+   * `whitelist: true` del ValidationPipe global: las claves que ningún
+   * decorador declara se QUITAN del body, sin error (no hay
+   * `forbidNonWhitelisted`). Por eso un `"triger"` mal tipeado no da 400 en el
+   * PATCH: se descarta y se guarda el resto.
+   */
+  private whitelist(body: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(body)) if (DECLARED_KEYS.has(k)) out[k] = v;
+    return out;
+  }
+
+  /**
+   * `@IsOptional()` de class-validator SALTEA todas las validaciones cuando el
+   * valor es `null` o `undefined` — no sólo `undefined`. Es lo que deja pasar
+   * un `trigger: null` por el PATCH (verificado con class-validator 0.14.3).
+   */
+  private skipsValidation(value: unknown): boolean {
+    return value === null || value === undefined;
+  }
+
   /** Los requeridos de `AutomationConfig` (POST y PUT). */
-  private validateFull(body: Record<string, unknown>): string[] {
+  private validateFull(raw: Record<string, unknown>): string[] {
+    const body = this.whitelist(raw);
     const errors: string[] = [];
-    if (body.id !== undefined) {
+    if (!this.skipsValidation(body.id)) {
       if (typeof body.id !== 'string') errors.push('id must be a string');
       else if (!body.id) errors.push('id should not be empty');
     }
+    // name/enabled/trigger/actions NO son @IsOptional: null también falla.
     if (typeof body.name !== 'string') errors.push('name must be a string');
     else if (!body.name) errors.push('name should not be empty');
     if (typeof body.enabled !== 'boolean') errors.push('enabled must be a boolean value');
@@ -77,7 +125,7 @@ export class FakeCceApi {
     }
     if (!Array.isArray(body.actions)) errors.push('actions must be an array');
     if (
-      body.sourceAction !== undefined &&
+      !this.skipsValidation(body.sourceAction) &&
       !['on', 'off', 'toggle'].includes(String(body.sourceAction))
     ) {
       errors.push('sourceAction must be one of the following values: on, off, toggle');
@@ -86,16 +134,23 @@ export class FakeCceApi {
   }
 
   /** `PatchAutomationDto`: todo opcional, y sourceAction SIN 'toggle' (CCE#109). */
-  private validatePatch(body: Record<string, unknown>): string[] {
+  private validatePatch(raw: Record<string, unknown>): string[] {
+    const body = this.whitelist(raw);
     const errors: string[] = [];
-    if (body.name !== undefined) {
+    if (!this.skipsValidation(body.name)) {
       if (typeof body.name !== 'string') errors.push('name must be a string');
       else if (!body.name) errors.push('name should not be empty');
     }
-    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+    if (!this.skipsValidation(body.enabled) && typeof body.enabled !== 'boolean') {
       errors.push('enabled must be a boolean value');
     }
-    if (body.sourceAction !== undefined && !['on', 'off'].includes(String(body.sourceAction))) {
+    if (!this.skipsValidation(body.trigger) && typeof body.trigger !== 'object') {
+      errors.push('trigger must be an object');
+    }
+    if (
+      !this.skipsValidation(body.sourceAction) &&
+      !['on', 'off'].includes(String(body.sourceAction))
+    ) {
       errors.push('sourceAction must be one of the following values: on, off');
     }
     return errors;
@@ -125,6 +180,18 @@ export class FakeCceApi {
     const payload = (body ?? {}) as Record<string, unknown>;
 
     if (path === '/api/config/automations' && method === 'GET') {
+      // `projectAutomation` corre en CADA lectura y hace `clone(auto.trigger)`
+      // + `trigger.sensorTriggers?…`: con un trigger nulo tira TypeError, y el
+      // borde HTTP lo convierte en 500. Desde ahí la config es ilegible para
+      // todos los clientes hasta editar el cce-config.json a mano.
+      const roto = this.automations.find((a) => !a.trigger || typeof a.trigger !== 'object');
+      if (roto) {
+        return nest(
+          500,
+          `Cannot read properties of null (reading 'sensorTriggers') [${roto.id}]`,
+          'Internal Server Error',
+        );
+      }
       return { status: 200, body: this.automations };
     }
 
@@ -137,7 +204,7 @@ export class FakeCceApi {
       if (this.automations.some((a) => a.id === wanted)) {
         return nest(409, `Ya existe una automatización con id ${wanted}`, 'Conflict');
       }
-      const created = { ...this.strip(payload), id: wanted } as Stored;
+      const created = { ...this.strip(this.whitelist(payload)), id: wanted } as Stored;
       this.automations.push(created);
       this.version++;
       return { status: 201, body: { success: true, automation: created, version: this.version } };
@@ -148,7 +215,7 @@ export class FakeCceApi {
       if (errors.length) return nest(400, errors, 'Bad Request');
       const i = this.automations.findIndex((a) => a.id === id);
       if (i === -1) return nest(404, `No existe la automatización ${id}`, 'Not Found');
-      const { id: _whitelisted, ...rest } = payload;
+      const { id: _whitelisted, ...rest } = this.whitelist(payload);
       this.automations[i] = { ...this.automations[i], ...this.strip(rest) } as Stored;
       this.version++;
       return {
@@ -214,7 +281,11 @@ export class FakeCceApi {
         // La petición SALIÓ (el server la aplica) y la respuesta se pierde:
         // el caso que deja el estado en duda.
         this.handle(method, path, body, headerOf(config));
-        throw new TransportError('socket hang up (ECONNRESET) contra el doble', 'ECONNRESET');
+        throw new TransportError(
+          'socket hang up (ECONNRESET) contra el doble',
+          'ECONNRESET',
+          true, // el pedido salió: el doble ya lo aplicó
+        );
       }
       const reply = this.handle(method, path, body, headerOf(config));
       if (reply.status >= 400) {

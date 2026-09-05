@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { after, before, test } from 'node:test';
-import { ApiError, apiErrorMessage } from '../src/lib/api-client.js';
+import {
+  ApiError,
+  UnknownStateError,
+  apiErrorMessage,
+  isTransportError,
+  isUnknownState,
+} from '../src/lib/api-client.js';
 import { createApiClient } from '../src/lib/api-client.js';
 
 /**
@@ -191,4 +197,56 @@ test('el header X-Config-Version llega al caller', async () => {
   const { headers } = await clientForTest().get('/lo-que-sea');
 
   assert.equal(headers['x-config-version'], '620');
+});
+
+// ── transporte: qué salió y qué no ────────────────────────────────────────
+
+test('ECONNREFUSED: la API está caída, NO salió nada — no es estado desconocido', async () => {
+  // Un puerto cerrado en loopback: el connect falla antes de escribir el
+  // request. Decir «pudo haberse aplicado, verificá con list» sería falso, y
+  // el `list` que sugiere falla igual.
+  const client = createApiClient({ apiUrl: 'http://127.0.0.1:1', timeoutMs: 2000 });
+
+  try {
+    await client.post('/config/automations', { name: 'x' });
+    assert.fail('debería haber fallado');
+  } catch (e) {
+    assert.ok(isTransportError(e), `vino ${String(e)}`);
+    assert.equal(e.sent, false);
+    assert.equal(isUnknownState(e), false);
+    assert.match(e.message, /Cannot reach CCE API/);
+  }
+});
+
+test('la conexión cortada a mitad SÍ deja el estado en duda', async () => {
+  const cortante = http.createServer((req) => {
+    req.socket.destroy(); // el request ya viajó; la respuesta no vuelve
+  });
+  await new Promise<void>((r) => cortante.listen(0, '127.0.0.1', r));
+  const addr = cortante.address();
+  if (!addr || typeof addr === 'string') throw new Error('sin puerto');
+  const client = createApiClient({ apiUrl: `http://127.0.0.1:${addr.port}`, timeoutMs: 2000 });
+
+  try {
+    await client.post('/config/automations', { name: 'x' });
+    assert.fail('debería haber fallado');
+  } catch (e) {
+    assert.ok(isTransportError(e), `vino ${String(e)}`);
+    assert.equal(e.sent, true);
+    assert.equal(isUnknownState(e), true);
+  } finally {
+    await new Promise<void>((r) => cortante.close(() => r()));
+  }
+});
+
+test('un 5xx es estado desconocido; un 4xx no', () => {
+  assert.equal(isUnknownState(new ApiError('HTTP 502: x', 502)), true);
+  assert.equal(isUnknownState(new ApiError('HTTP 500: x', 500)), true);
+  assert.equal(isUnknownState(new ApiError('HTTP 409: x', 409)), false);
+  assert.equal(isUnknownState(new ApiError('HTTP 404: x', 404)), false);
+});
+
+test('un UnknownStateError (2xx sin id) también cuenta', () => {
+  assert.equal(isUnknownState(new UnknownStateError('se creó pero no sé con qué id')), true);
+  assert.equal(isUnknownState(new Error('cualquier otra cosa')), false);
 });

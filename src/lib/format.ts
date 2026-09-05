@@ -73,6 +73,15 @@ export function note(msg: string): void {
   console.error(chalk.blue('ℹ'), msg);
 }
 
+/**
+ * Como `success`, pero por STDERR. Un reporte partido entre los dos streams se
+ * lee a medias con `2>/dev/null` o con `> log`: el de `create` va entero por
+ * stderr, que es donde ya salían sus errores y avisos.
+ */
+export function successNote(msg: string): void {
+  console.error(chalk.green('✓'), msg);
+}
+
 export function fail(msg: string): void {
   console.error(chalk.red('✗'), msg);
 }

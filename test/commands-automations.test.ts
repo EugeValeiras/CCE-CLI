@@ -162,7 +162,7 @@ test('create: con un item SIN id aplicado, el consejo advierte que reaplicar DUP
   assert.match(out, /Con id generado por la API \(1\)/);
   assert.match(out, /«sin id» → auto_gen_0/);
   assert.match(out, /NO reapliques el archivo tal cual/);
-  assert.match(out, /dos automatizaciones idénticas sobre el mismo trigger/);
+  assert.match(out, /automatizaciones duplicadas sobre el mismo trigger/);
 });
 
 test('create: falla el primer item → dice que no quedó nada escrito', async () => {
@@ -196,10 +196,12 @@ test('create: una automatización exportada avisa que el flujo editado NO se gua
 
   assert.equal(exitCode, 0);
   assert.match(out, /Actualizadas \(1\): auto_1/);
-  // El punto: el ✓ solo sería un no-op silencioso.
+  // El ✓ solo sería un no-op silencioso: el flujo editado no viaja.
   assert.match(out, /flowDerived/);
-  assert.match(out, /NO se persiste/);
-  assert.equal(api.automations[0].flow, undefined, 'la API descartó el flujo, como en producción');
+  assert.match(out, /se quitaron "flow"\/"when" del envío/);
+  const enviado = api.calls.at(-1)?.body as Record<string, unknown>;
+  assert.equal(enviado.flow, undefined);
+  assert.equal(api.automations[0].flow, undefined);
 });
 
 test('create: un archivo que no es JSON falla con exit 1 y sin tocar la API', async () => {
@@ -230,7 +232,8 @@ test('create: un corte de RED avisa que el estado es DESCONOCIDO, no que no se e
   assert.match(out, /Estado DESCONOCIDO/);
   assert.match(out, /cce automations list/);
   // Y el consejo NO puede ser «reintentá tranquilo»: el item no tiene id.
-  assert.match(out, /queda DUPLICADO/);
+  assert.match(out, /NO reapliques el archivo tal cual/);
+  assert.match(out, /no se sabe si entró/);
   assert.doesNotMatch(out, /lo ACTUALIZA en vez de duplicarlo/);
   assert.equal(api.automations.length, 1, 'la API sí lo había aplicado');
 });
@@ -315,4 +318,97 @@ test('enable: un id inexistente sale con exit 1 y el MENSAJE de la API', async (
   assert.equal(exitCode, 1);
   assert.match(out, /No existe la automatización auto_fantasma/);
   assert.doesNotMatch(out, /HTTP 404: Not Found/);
+});
+
+// ── el consejo tras un abort mixto ────────────────────────────────────────
+
+test('abort mixto: el consejo nombra TODO lo que duplicaría, no sólo lo último', async () => {
+  // Un item sin id ya aplicado, y el corte de red sobre el SIGUIENTE, también
+  // sin id. El consejo anterior acotaba el riesgo al que cortó y contradecía al
+  // stderr, que enumeraba además el primero — con lo cual invitaba a
+  // re-POSTear justo lo que ya había entrado.
+  api.afterCall = (nth, a) => {
+    if (nth === 1) a.killNext = { method: 'POST' };
+  };
+
+  const { out } = await run(
+    'automations',
+    'create',
+    '-f',
+    fileWith([fullAutomation(), fullAutomation()]),
+  );
+
+  assert.match(out, /NO reapliques el archivo tal cual/);
+  assert.match(out, /las que la API numeró \(auto_gen_0\)/);
+  assert.match(out, /el item que cortó .*no se sabe si entró/);
+});
+
+test('«No quedó nada escrito» no se afirma cuando el estado es desconocido', async () => {
+  api.killNext = { method: 'POST' };
+
+  const { out } = await run('automations', 'create', '-f', fileWith(fullAutomation('auto_1')));
+
+  assert.match(out, /Estado DESCONOCIDO/);
+  assert.doesNotMatch(out, /No quedó nada escrito/);
+});
+
+test('«No quedó nada escrito» sí se afirma cuando la API contestó 400', async () => {
+  const { out } = await run('automations', 'create', '-f', fileWith({ id: 'auto_a', name: '' }));
+
+  assert.match(out, /No quedó nada escrito/);
+});
+
+// ── lo que el CLI se niega a mandar ───────────────────────────────────────
+
+test('create: un trigger en null se rechaza acá, sin tocar la API', async () => {
+  seed(fullAutomation('auto_1'));
+
+  const { out, exitCode } = await run(
+    'automations',
+    'create',
+    '-f',
+    fileWith({ id: 'auto_1', trigger: null }),
+  );
+
+  assert.equal(exitCode, 1);
+  assert.equal(api.calls.length, 0);
+  assert.match(out, /"trigger" en null/);
+  // Y la config sigue siendo legible.
+  assert.equal(api.handle('GET', '/api/config/automations').status, 200);
+});
+
+test('create: una clave mal tipeada se rechaza con la sugerencia', async () => {
+  seed(fullAutomation('auto_1'));
+
+  const { out, exitCode } = await run(
+    'automations',
+    'create',
+    '-f',
+    fileWith({ id: 'auto_1', enabeld: false }),
+  );
+
+  assert.equal(exitCode, 1);
+  assert.equal(api.calls.length, 0);
+  assert.match(out, /"enabeld" \(¿"enabled"\?\)/);
+  assert.equal(api.automations[0].enabled, true, 'no se tocó nada');
+});
+
+// ── el reporte, por un solo stream ────────────────────────────────────────
+
+test('el reporte entero sale por stderr (se lee igual con stdout redirigido)', async () => {
+  const real = console.log;
+  const stdout: string[] = [];
+  console.log = (...a: unknown[]) => stdout.push(a.join(' '));
+  try {
+    await run(
+      'automations',
+      'create',
+      '-f',
+      fileWith([fullAutomation('auto_a'), { id: 'auto_b', name: '' }]),
+    );
+  } finally {
+    console.log = real;
+  }
+
+  assert.deepEqual(stdout, [], 'nada del reporte se fue por stdout');
 });

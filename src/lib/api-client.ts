@@ -47,7 +47,14 @@ export function isApiError(e: unknown, status?: number): e is ApiError {
 export class TransportError extends Error {
   constructor(
     message: string,
-    readonly code?: string,
+    readonly code: string | undefined,
+    /**
+     * Si la petición llegó a SALIR. Con `false` —la API caída, el host que no
+     * resuelve— no se escribió nada y decirlo es información dura; con `true`
+     * el pedido viajó y la respuesta se perdió, que es el único caso en que el
+     * cliente no puede saber en qué estado quedó la casa.
+     */
+    readonly sent: boolean,
     readonly cause?: unknown,
   ) {
     super(message);
@@ -57,6 +64,46 @@ export class TransportError extends Error {
 
 export function isTransportError(e: unknown): e is TransportError {
   return e instanceof TransportError;
+}
+
+/**
+ * Códigos en los que la petición NO salió: no hubo con quién hablar. Todo lo
+ * demás (conexión cortada a mitad, timeout, pipe roto) pasó DESPUÉS de escribir
+ * el request, así que el servidor pudo haberlo aplicado.
+ */
+const NEVER_SENT = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EAI_AGAIN',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+  'CERT_HAS_EXPIRED',
+]);
+
+/**
+ * Si tras este error el estado del servidor quedó en duda.
+ *
+ * Son dos familias: la petición salió y no volvió respuesta, y el 5xx que puede
+ * llegar DESPUÉS de que la API ya guardó (un 502 del proxy si el upstream muere
+ * a mitad, o un 500 de un listener post-commit). En ambas, «no se escribió
+ * nada» es una afirmación que el cliente no puede hacer.
+ */
+export function isUnknownState(e: unknown): boolean {
+  if (isTransportError(e)) return e.sent;
+  if (isApiError(e)) return e.status >= 500;
+  return e instanceof UnknownStateError;
+}
+
+/**
+ * Para el caso raro pero real: la API respondió 2xx y aun así no se puede
+ * seguir (p. ej. un POST sin el id de lo que creó). La escritura ocurrió.
+ */
+export class UnknownStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnknownStateError';
+  }
 }
 
 /**
@@ -120,16 +167,16 @@ export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
           new TransportError(
             `Cannot reach CCE API at ${baseURL}. Is it running?`,
             err.code,
+            false,
             err,
           ),
         );
       }
-      // Timeout, conexión cortada, DNS: la petición SALIÓ y no sabemos si el
-      // servidor la aplicó. Ver `TransportError`.
       return Promise.reject(
         new TransportError(
           `${err.message ?? 'fallo de red'} (${err.code ?? 'sin código'}) contra ${baseURL}`,
           err.code,
+          !NEVER_SENT.has(String(err.code)),
           err,
         ),
       );

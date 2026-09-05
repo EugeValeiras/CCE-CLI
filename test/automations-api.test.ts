@@ -6,7 +6,7 @@ import {
   AutomationsHttp,
   HttpResponse,
   deleteAutomation,
-  derivedFlowWarnings,
+  prepareBulkAutomations,
   replaceAllAutomations,
   retryIsSafe,
   setAutomationEnabled,
@@ -192,21 +192,24 @@ test('create: un error que no es 400/409 corta ahí y NO se intenta el resto', a
   assert.equal(calls.length, 2);
 });
 
-test('create: si el POST no devuelve el id, se corta en vez de reportar un id vacío', async () => {
+test('create: un 2xx sin id es ESTADO DESCONOCIDO — la automatización se creó igual', async () => {
   const { client } = fakeHttp(() => ({ data: { success: true } }));
 
   const report = await upsertAutomations(client, [auto()]);
 
   assert.equal(report.applied.length, 0);
-  assert.match(report.failed?.message ?? '', /no devolvió el id/);
+  assert.match(report.failed?.message ?? '', /no devolvió su id/);
+  // La API respondió 2xx: existe. Decir «no se escribió, reintentá» duplicaría.
+  assert.equal(report.failed?.stateUnknown, true);
+  assert.equal(retryIsSafe(report), false);
 });
 
 // ── create: el contrato real (doble que valida como la API) ───────────────
 
-test('create: un PARCHE PARCIAL sobre algo existente se aplica, aunque el POST lo rechace', async () => {
-  // El caso que el fake complaciente daba por bueno: el ValidationPipe corre
-  // ANTES del handler, así que `{id, enabled:false}` NUNCA llega al 409 —
-  // se lleva un 400 por name/trigger/actions faltantes.
+test('create: un PARCHE PARCIAL va DIRECTO al PATCH — ni se intenta el POST', async () => {
+  // La forma del body decide el método: sin las cuatro claves requeridas no
+  // hay nada que crear, así que probar el POST sólo gasta un round-trip y una
+  // validación que va a fallar.
   const api = new FakeCceApi([fullAutomation('auto_1', { enabled: true }) as never]);
 
   const report = await upsertAutomations(api.asHttpClient(), [
@@ -215,7 +218,7 @@ test('create: un PARCHE PARCIAL sobre algo existente se aplica, aunque el POST l
 
   assert.deepEqual(
     api.calls.map((c) => `${c.method} ${c.path}`),
-    ['POST /api/config/automations', 'PATCH /api/config/automations/auto_1'],
+    ['PATCH /api/config/automations/auto_1'],
   );
   assert.equal(report.failed, undefined, report.failed?.message);
   assert.equal(report.applied[0].action, 'updated');
@@ -224,21 +227,22 @@ test('create: un PARCHE PARCIAL sobre algo existente se aplica, aunque el POST l
   assert.equal(api.automations[0].name, 'auto auto_1');
 });
 
-test('create: un body incompleto para algo que NO existe reporta el error del POST, no «no existe»', async () => {
+test('create: un parche sobre un id que NO existe dice «no existe», no «name must be a string»', async () => {
+  // Con el fallback viejo, este 404 se descartaba y salía el 400 del POST: el
+  // operador completaba el body y terminaba CREANDO una automatización que no
+  // quería, sobre el mismo trigger que la que quiso editar.
   const api = new FakeCceApi([]);
 
   const report = await upsertAutomations(api.asHttpClient(), [
-    { id: 'auto_nueva', enabled: false } as AutomationInput,
+    { id: 'auto_con_typo_en_el_id', enabled: false } as AutomationInput,
   ]);
 
-  // Intenta el PATCH (por si existía), se lleva un 404, y reporta el 400
-  // original: el problema real es que el body no alcanza para CREAR.
   assert.deepEqual(
     api.calls.map((c) => c.method),
-    ['POST', 'PATCH'],
+    ['PATCH'],
   );
-  assert.match(report.failed?.message ?? '', /name must be a string|name should not be empty/);
-  assert.doesNotMatch(report.failed?.message ?? '', /No existe la automatización/);
+  assert.match(report.failed?.message ?? '', /No existe la automatización auto_con_typo_en_el_id/);
+  assert.equal(api.automations.length, 0);
 });
 
 test('create: un alta COMPLETA nueva entra de una, sin PATCH', async () => {
@@ -392,40 +396,58 @@ const exportada = (id: string): AutomationInput =>
     when: [{ type: 'manual' }],
   }) as AutomationInput;
 
-test('create: avisa que la API descarta flow/when en los items flowDerived', async () => {
+test('create: el flujo derivado NO se manda — se quita antes, y se dice', async () => {
   const api = new FakeCceApi([fullAutomation('auto_1') as never]);
 
   const report = await upsertAutomations(api.asHttpClient(), [exportada('auto_1')]);
 
   assert.equal(report.applied[0].action, 'updated');
+  // Lo que sale por el cable ya no lleva el flujo proyectado: mandarlo para que
+  // la API lo descarte es lo que hacía creer que se había guardado.
+  const enviado = api.calls.at(-1)?.body as Record<string, unknown>;
+  assert.equal(enviado.flow, undefined);
+  assert.equal(enviado.when, undefined);
+  assert.equal(enviado.flowDerived, undefined);
+  assert.equal(enviado.name, 'auto auto_1');
   assert.equal(report.warnings.length, 1);
-  assert.match(report.warnings[0], /flowDerived/);
-  // Y el doble confirma el descarte: el flujo editado no se guardó.
-  assert.equal(api.automations[0].flow, undefined);
+  assert.match(report.warnings[0], /se quitaron "flow"\/"when"/);
+  // Y el consejo ya no es «quitá flowDerived y reaplicá», que corrompe si
+  // además se editaron las actions.
+  assert.doesNotMatch(report.warnings[0], /quitá "flowDerived" de ese item/);
 });
 
-test('create: el aviso de flowDerived NO habla de items que nunca se enviaron', async () => {
+test('create: el aviso del flujo derivado sale UNA vez, no por item', async () => {
   const api = new FakeCceApi([]);
 
   const report = await upsertAutomations(api.asHttpClient(), [
-    exportada('auto_enviada'),
-    // Corta acá: sin name no se puede crear NI parchear.
-    { id: 'auto_corta', name: '' } as AutomationInput,
-    exportada('auto_nunca_enviada'),
+    exportada('auto_a'),
+    exportada('auto_b'),
   ]);
 
-  assert.equal(report.failed?.label, 'auto_corta');
-  assert.match(report.warnings[0], /auto_enviada/);
-  assert.doesNotMatch(report.warnings[0], /auto_nunca_enviada/);
+  assert.equal(report.failed, undefined);
+  assert.equal(report.warnings.length, 1);
 });
 
-test('sin flowDerived (o sin flow) no hay aviso', async () => {
-  assert.deepEqual(derivedFlowWarnings([auto('auto_1')]), []);
-  assert.deepEqual(
-    derivedFlowWarnings([fullAutomation('auto_1', { flowDerived: true }) as AutomationInput]),
-    [],
-  );
-  assert.equal(derivedFlowWarnings([exportada('auto_1')]).length, 1);
+test('el replace masivo también le saca el flujo derivado a cada item', () => {
+  const { body, warnings } = prepareBulkAutomations([
+    exportada('auto_1'),
+    fullAutomation('auto_2'),
+  ]);
+
+  const enviados = body as AutomationInput[];
+  assert.equal(enviados[0].flow, undefined);
+  assert.equal(enviados[0].when, undefined);
+  assert.equal(enviados[0].flowDerived, undefined);
+  assert.equal(enviados[0].name, 'auto auto_1', 'el resto del item viaja igual');
+  assert.deepEqual(enviados[1], fullAutomation('auto_2'));
+  assert.equal(warnings.length, 1);
+});
+
+test('sin flowDerived no se toca nada y no hay aviso', () => {
+  const { body, warnings } = prepareBulkAutomations([fullAutomation('auto_1')]);
+
+  assert.deepEqual(body, [fullAutomation('auto_1')]);
+  assert.deepEqual(warnings, []);
 });
 
 // ── delete / enable / disable ─────────────────────────────────────────────
@@ -620,6 +642,112 @@ test('delete: borrar una no puede pisar una escritura ajena', async () => {
 });
 
 test('el doble deja constancia: un TransportError no es un ApiError', () => {
-  assert.ok(new TransportError('x', 'ECONNRESET') instanceof Error);
-  assert.ok(!(new TransportError('x', 'ECONNRESET') instanceof ApiError));
+  assert.ok(new TransportError('x', 'ECONNRESET', true) instanceof Error);
+  assert.ok(!(new TransportError('x', 'ECONNRESET', true) instanceof ApiError));
+});
+
+// ── lo que NO se manda: la API lo acepta y después se rompe ───────────────
+
+test('create: un `null` NO sale del CLI — por PATCH la API lo acepta y deja la config ilegible', async () => {
+  const api = new FakeCceApi([fullAutomation('auto_1') as never]);
+
+  const report = await upsertAutomations(api.asHttpClient(), [
+    { id: 'auto_1', trigger: null } as unknown as AutomationInput,
+  ]);
+
+  assert.equal(api.calls.length, 0, 'no salió ni una petición');
+  assert.match(report.failed?.message ?? '', /"trigger" en null/);
+  assert.match(report.failed?.message ?? '', /la config queda rota/);
+  assert.equal(report.failed?.stateUnknown, false);
+});
+
+test('el daño que evita ese guard: un PATCH con trigger:null rompe TODA lectura', async () => {
+  // Sin el chequeo local esto es lo que pasaba: `PatchAutomationDto` declara
+  // todo `@IsOptional()` y class-validator saltea la validación en null, así
+  // que la API guarda (con fsync) y recién después `projectAutomation` explota.
+  const api = new FakeCceApi([fullAutomation('auto_1') as never]);
+
+  const patch = api.handle('PATCH', '/api/config/automations/auto_1', { trigger: null });
+  assert.equal(patch.status, 200, 'la API lo ACEPTA');
+
+  const get = api.handle('GET', '/api/config/automations');
+  assert.equal(get.status, 500, 'y desde ahí toda lectura falla');
+});
+
+test('create: una clave mal tipeada NO se manda — la whitelist la borraría en silencio', async () => {
+  const api = new FakeCceApi([fullAutomation('auto_1') as never]);
+  const conTypo = {
+    ...fullAutomation('auto_1', { name: 'renombrada' }),
+    triger: { type: 'schedule', time: '19:00' },
+  } as unknown as AutomationInput;
+  delete (conTypo as Record<string, unknown>).trigger;
+
+  const report = await upsertAutomations(api.asHttpClient(), [conTypo]);
+
+  assert.equal(api.calls.length, 0, 'no salió ni una petición');
+  assert.match(report.failed?.message ?? '', /"triger" \(¿"trigger"\?\)/);
+  assert.match(report.failed?.message ?? '', /a medio escribir/);
+});
+
+test('el daño que evita ese guard: la API guarda el resto sobre el trigger VIEJO', async () => {
+  const api = new FakeCceApi([
+    fullAutomation('auto_1', { name: 'vieja', trigger: { type: 'manual' } }) as never,
+  ]);
+
+  const reply = api.handle('PATCH', '/api/config/automations/auto_1', {
+    name: 'nueva',
+    triger: { type: 'schedule', time: '19:00' },
+  });
+
+  assert.equal(reply.status, 200, 'la API responde 200…');
+  assert.equal(api.automations[0].name, 'nueva');
+  assert.deepEqual(api.automations[0].trigger, { type: 'manual' }, '…con el trigger viejo');
+});
+
+test('create: un item que sólo trae id no gatilla un commit vacío', async () => {
+  const api = new FakeCceApi([fullAutomation('auto_1') as never]);
+
+  const report = await upsertAutomations(api.asHttpClient(), [
+    { id: 'auto_1' } as AutomationInput,
+  ]);
+
+  assert.equal(api.calls.length, 0);
+  assert.match(report.failed?.message ?? '', /sólo trae "id"/);
+});
+
+test('create: el rechazo local corta el archivo como cualquier otro error', async () => {
+  const api = new FakeCceApi([]);
+
+  const report = await upsertAutomations(api.asHttpClient(), [
+    fullAutomation('auto_a') as AutomationInput,
+    { id: 'auto_b', enabeld: false } as unknown as AutomationInput,
+    fullAutomation('auto_c') as AutomationInput,
+  ]);
+
+  assert.deepEqual(report.applied.map((o) => o.id), ['auto_a']);
+  assert.match(report.failed?.message ?? '', /"enabeld" \(¿"enabled"\?\)/);
+  assert.deepEqual(report.notAttempted, ['auto_c']);
+});
+
+// ── 5xx: el estado también queda en duda ──────────────────────────────────
+
+test('un 5xx puede llegar DESPUÉS del commit: es estado desconocido', async () => {
+  const { client } = fakeHttp(() => {
+    throw nestError(502, { message: 'Bad Gateway', error: 'Bad Gateway', statusCode: 502 });
+  });
+
+  const report = await upsertAutomations(client, [auto()]);
+
+  assert.equal(report.failed?.stateUnknown, true);
+  assert.equal(retryIsSafe(report), false);
+});
+
+test('un 4xx no lo es: la API rechazó antes de escribir', async () => {
+  const { client } = fakeHttp(() => {
+    throw validationError('name should not be empty');
+  });
+
+  const report = await upsertAutomations(client, [auto()]);
+
+  assert.equal(report.failed?.stateUnknown, false);
 });

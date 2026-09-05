@@ -1,5 +1,5 @@
 import { Automation } from '../types/api.js';
-import { ApiError, isApiError, isTransportError } from './api-client.js';
+import { ApiError, UnknownStateError, isApiError, isUnknownState } from './api-client.js';
 
 /**
  * CCE#107 — Las escrituras de automatizaciones, item por item.
@@ -41,9 +41,7 @@ export interface AutomationsHttp {
 
 /**
  * Lo que trae el archivo de `create`. El id es opcional: sin id, la API genera
- * uno y lo devuelve. El resto se manda tal cual venga — validarlo acá sería
- * duplicar (y desincronizar) el DTO del backend, que ya responde 400 con la
- * ruta exacta del step que está mal.
+ * uno y lo devuelve.
  */
 export type AutomationInput = Partial<Automation> & Record<string, unknown>;
 
@@ -72,8 +70,8 @@ export interface UpsertFailure {
   /** Si el archivo traía id para este item. */
   hadId: boolean;
   /**
-   * true cuando el error fue de TRANSPORTE y no una respuesta del servidor: la
-   * escritura pudo haberse aplicado igual. Ver `TransportError`.
+   * true cuando no se puede afirmar que la escritura NO ocurrió: la respuesta
+   * se perdió, o el 5xx llegó después del commit. Ver `isUnknownState`.
    */
   stateUnknown: boolean;
 }
@@ -93,7 +91,7 @@ export interface UpsertFailure {
  * Lo que NO puede pasar —y por eso este reporte existe— es que falle en
  * silencio: `applied` dice qué quedó escrito, `failed` en cuál cortó, por qué y
  * si el estado quedó en duda, `notAttempted` qué ni se intentó, y `warnings` lo
- * que la API aceptó pero no persistió como el archivo pretendía.
+ * que se mandó distinto de lo que el archivo pedía.
  */
 export interface UpsertReport {
   applied: UpsertOutcome[];
@@ -116,10 +114,9 @@ export function labelOf(item: AutomationInput): string {
  * encuentra el existente y lo actualiza. Un item SIN id no lo es — cada POST
  * acuña un id nuevo, así que reaplicar crea un DUPLICADO de lo que ya entró, y
  * la casa queda con dos automatizaciones idénticas disparando sobre el mismo
- * trigger. Decir "reintentá tranquilo" en ese caso es un consejo que rompe
- * cosas.
+ * trigger.
  *
- * Un corte por transporte sobre un item SIN id cae en la misma trampa: no se
+ * Un corte sin respuesta sobre un item SIN id cae en la misma trampa: no se
  * sabe si entró, así que reintentar puede duplicarlo igual.
  */
 export function retryIsSafe(report: UpsertReport): boolean {
@@ -128,46 +125,153 @@ export function retryIsSafe(report: UpsertReport): boolean {
   return true;
 }
 
+// ── Validación local: lo que la API acepta y después no puede leer ────────
+
+/**
+ * Las claves que los DTOs de la API declaran (`AutomationConfig` y
+ * `PatchAutomationDto`, `automation.dto.ts`).
+ *
+ * El ValidationPipe global corre con `whitelist: true` y SIN
+ * `forbidNonWhitelisted`: una clave que no esté acá se descarta EN SILENCIO y
+ * la escritura sigue adelante con el resto. Un `"triger"` mal tipeado no da
+ * error: guarda name/enabled/actions sobre el trigger VIEJO y responde 200.
+ * Por eso el CLI corta antes: es la diferencia entre un typo y una
+ * automatización a medio escribir.
+ */
+const KNOWN_KEYS = new Set([
+  'id',
+  'name',
+  'icon',
+  'enabled',
+  'source',
+  'sourceId',
+  'sourceAction',
+  'sourceSmart',
+  'mode',
+  'trigger',
+  'actions',
+  'when',
+  'flow',
+  'flowDerived',
+  'flowLayout',
+  'onRetrigger',
+  'planId',
+  'planIds',
+]);
+
+/** Las cuatro que `AutomationConfig` exige para poder CREAR. */
+const REQUIRED_TO_CREATE = ['name', 'enabled', 'trigger', 'actions'] as const;
+
+/** Distancia de edición acotada, sólo para sugerir la clave que se quiso escribir. */
+function closest(key: string): string | undefined {
+  let best: string | undefined;
+  let bestDistance = 3; // más lejos que esto ya no es un typo
+  for (const known of KNOWN_KEYS) {
+    const d = editDistance(key.toLowerCase(), known.toLowerCase());
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = known;
+    }
+  }
+  return best;
+}
+
+function editDistance(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const previous = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = previous;
+    }
+  }
+  return prev[b.length];
+}
+
+/**
+ * Lo que hay que rechazar ANTES de mandar, porque la API lo acepta y recién
+ * después se rompe.
+ *
+ *  - `null` en cualquier campo: `PatchAutomationDto` los declara
+ *    `@IsOptional()`, y class-validator SALTEA la validación en `null`. Un
+ *    `{"trigger": null}` se guarda con fsync y a partir de ahí
+ *    `projectAutomation` explota en CADA lectura: la App, el Dashboard y
+ *    `cce automations list` reciben 500, el motor de schedules se cae, y en el
+ *    próximo reinicio la config no carga. Se arregla editando el
+ *    cce-config.json a mano.
+ *  - Claves desconocidas: ver `KNOWN_KEYS`.
+ *  - Un item que sólo trae `id`: el PATCH vacío igual commitea (bump de
+ *    versión, fsync, recarga de motores y broadcast) y se reportaría como
+ *    «actualizada» sin haber cambiado nada.
+ */
+function localRejection(item: AutomationInput): string | undefined {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    return 'no es un objeto JSON.';
+  }
+  const keys = Object.keys(item);
+  if (!keys.length) return 'está vacío.';
+  const unknown = keys.filter((k) => !KNOWN_KEYS.has(k));
+  if (unknown.length) {
+    const hints = unknown.map((k) => {
+      const near = closest(k);
+      return near ? `"${k}" (¿"${near}"?)` : `"${k}"`;
+    });
+    return (
+      `clave(s) que la API no conoce: ${hints.join(', ')}. Las descartaría en silencio ` +
+      '(whitelist) y guardaría el resto, dejando la automatización a medio escribir.'
+    );
+  }
+  const nulls = keys.filter((k) => item[k] === null);
+  if (nulls.length) {
+    return (
+      `${nulls.map((k) => `"${k}"`).join(', ')} en null. La API lo acepta por PATCH y ` +
+      'después no puede leer la automatización: la config queda rota para TODOS los ' +
+      'clientes. Si querías vaciar el campo, mandá el valor vacío que corresponda.'
+    );
+  }
+  if (keys.length === 1 && keys[0] === 'id') {
+    return 'sólo trae "id": no hay nada que escribir.';
+  }
+  return undefined;
+}
+
 /**
  * Crea o actualiza cada automatización del archivo, una por llamada.
  *
  * `create` es UPSERT: hoy el comando se usa para editar automatizaciones
  * existentes desde un archivo —exportar con `show --format json`, editar,
- * volver a aplicar— y convertirlo en error rompería ese flujo sin dar nada a
- * cambio.
+ * volver a aplicar— y convertirlo en error rompería ese flujo.
  *
- * El orden es POST y, si no se pudo crear, PATCH. Que sea POST-first y no
- * PATCH-first es deliberado: el DTO del PATCH valida MÁS ANGOSTO que el del
- * POST (EugeValeiras/CCE#109 — `sourceAction: 'toggle'` es válido para crear y
- * da 400 al parchear), así que probar con PATCH primero haría fallar altas
- * perfectamente válidas. Mientras esa asimetría exista, una creación no puede
- * pasar por el PATCH.
+ * QUÉ MÉTODO SE USA lo decide la FORMA del body, no una respuesta de error:
  *
- * La contracara es que el POST valida el body COMPLETO (`name`, `enabled`,
- * `trigger` y `actions` son requeridos en `AutomationConfig`), así que un
- * parche parcial —`{id, enabled:false}`— se lleva un 400 del ValidationPipe
- * ANTES de que el handler pueda responder 409. Por eso el fallback al PATCH
- * cubre 409 (ya existe) y también 400 (no sirve para crear, pero puede ser un
- * parche válido sobre algo que ya existe): ver `upsertOne`.
+ *  - sin `id` → POST (la API acuña el id).
+ *  - con `id` y las cuatro claves que `AutomationConfig` exige
+ *    (`name`/`enabled`/`trigger`/`actions`) → POST y, si responde 409 porque ya
+ *    existe, PATCH.
+ *  - con `id` y forma parcial → PATCH directo. Un 404 acá es «no existe», que
+ *    es exactamente lo que pasó.
  *
- * Diferencia real respecto del PUT masivo, y vale conocerla: el PATCH mergea
- * TOP-LEVEL, así que un campo que el archivo NO trae se conserva en vez de
- * borrarse. Es el lado seguro del cambio (omitir un campo ya no lo borra en
- * silencio), pero para vaciar una sección hay que mandarla explícitamente.
+ * La versión anterior probaba POST siempre y caía al PATCH ante CUALQUIER 400.
+ * Eso convertía al PATCH en un colador: su DTO es todo `@IsOptional()`, así que
+ * un body que el POST había rechazado —`trigger: null`, o con una clave mal
+ * tipeada que la whitelist descarta— se escribía igual, a medias o dejando la
+ * config ilegible. Decidir por la forma cierra las dos puertas, y de paso
+ * ahorra el round-trip de más en el camino de edición parcial.
+ *
+ * Diferencia real respecto del PUT masivo: el PATCH mergea TOP-LEVEL, así que
+ * un campo que el archivo NO trae se conserva en vez de borrarse.
  */
 export async function upsertAutomations(
   client: AutomationsHttp,
   items: AutomationInput[],
 ): Promise<UpsertReport> {
   const applied: UpsertOutcome[] = [];
-  // Los avisos se calculan sobre lo que se INTENTÓ, no sobre el archivo
-  // entero: tras un abort, avisar de items que nunca salieron es ruido que
-  // manda a revisar el lugar equivocado.
-  const attempted: AutomationInput[] = [];
+  const warnings: string[] = [];
   for (let i = 0; i < items.length; i++) {
-    attempted.push(items[i]);
     try {
-      applied.push(await upsertOne(client, items[i]));
+      applied.push(await upsertOne(client, items[i], warnings));
     } catch (e) {
       return {
         applied,
@@ -175,112 +279,112 @@ export async function upsertAutomations(
           label: labelOf(items[i]),
           message: (e as Error).message,
           hadId: Boolean(items[i]?.id),
-          stateUnknown: isTransportError(e),
+          stateUnknown: isUnknownState(e),
         },
         notAttempted: items.slice(i + 1).map(labelOf),
-        warnings: derivedFlowWarnings(attempted),
+        warnings,
       };
     }
   }
-  return { applied, notAttempted: [], warnings: derivedFlowWarnings(attempted) };
+  return { applied, notAttempted: [], warnings };
 }
 
 /**
- * El aviso del no-op silencioso más caro que tienen estos comandos.
+ * El flujo derivado se QUITA del envío, no se manda para que la API lo tire.
  *
  * `show --format json` estampa `flowDerived: true` en toda automatización cuyo
- * `flow` es la PROYECCIÓN del formato viejo — que en esta casa son todas. Al
- * reenviarlo, `stripDerivedFlow()` de la API borra `flow` y `when` del body
- * antes de guardar (para no persistir un flujo derivado que quedaría stale
- * respecto de `actions`). O sea: exportar → editar el flujo → reaplicar
- * descarta la edición, y la API responde 200. Sin este aviso, el CLI imprimía
- * «✓ Actualizadas» sobre un cambio que no ocurrió.
+ * `flow` es la proyección del formato viejo — en esta casa, todas. La API borra
+ * `flow`/`when` de esos bodies (`stripDerivedFlow`) para no persistir un flujo
+ * derivado que quedaría stale respecto de `actions`. Mandarlos igual no cambia
+ * el resultado y sí invita a creer que se guardaron.
  *
- * El CLI no borra `flowDerived` por su cuenta: no puede saber si el flujo del
- * archivo fue editado o es la proyección tal como salió, y quitarlo a ciegas
- * haría que la API persista un flujo derivado — el problema que la marca
- * existe para evitar. La decisión es del que editó, y acá se le dice cómo.
- *
- * Se exporta porque el replace masivo (`config set-remote automations`) manda
- * los mismos objetos por otra puerta y se come el mismo no-op.
+ * El aviso dice lo que PASÓ (se quitaron), no lo que habría que hacer: el
+ * consejo anterior —«quitá flowDerived y volvé a aplicar»— es una trampa si
+ * además se editaron las `actions`, porque persiste el flujo VIEJO junto a las
+ * acciones nuevas y el motor corre uno mientras las UIs muestran las otras.
  */
-export function derivedFlowWarnings(items: AutomationInput[]): string[] {
-  const marked = items.filter(
-    (a) => a?.flowDerived === true && (a.flow !== undefined || a.when !== undefined),
-  );
-  if (!marked.length) return [];
-  return [
-    `${marked.length} automatización(es) vienen con "flowDerived": true ` +
-      `(${marked.map(labelOf).join(', ')}): la API DESCARTA "flow" y "when" en esos items ` +
-      'y guarda el resto, así que una edición del flujo NO se persiste. Si editaste el ' +
-      'flujo, quitá "flowDerived" de ese item y volvé a aplicarlo.',
-  ];
+function stripDerivedFlow(item: AutomationInput, warnings: string[]): AutomationInput {
+  if (item.flowDerived !== true) return item;
+  const { flow, when, flowDerived, ...rest } = item;
+  if (flow === undefined && when === undefined) return rest;
+  const aviso =
+    'Los items marcados "flowDerived": true llevan el flujo PROYECTADO por la API, no ' +
+    'uno propio: se quitaron "flow"/"when" del envío porque la API los descarta igual ' +
+    '(el resto del item sí se guarda). Para escribir un flujo propio hay que mandarlo ' +
+    'sin la marca Y con las "actions" que le correspondan — si no, el motor corre el ' +
+    'flujo y las UIs muestran las actions.';
+  if (!warnings.includes(aviso)) warnings.push(aviso);
+  return rest;
 }
-
-/** Los status del POST tras los cuales todavía puede haber un PATCH que sirva. */
-const PATCH_WORTH_TRYING = new Set([400, 409]);
 
 async function upsertOne(
   client: AutomationsHttp,
   item: AutomationInput,
+  warnings: string[],
 ): Promise<UpsertOutcome> {
-  const id = typeof item?.id === 'string' ? item.id : '';
   const label = labelOf(item);
-  let postError: ApiError;
-  try {
-    const { data } = await client.post<CreateAutomationResponse>('/config/automations', item);
-    const assignedId = data?.automation?.id ?? id;
-    if (!assignedId) {
-      // Sin id no hay nada que reportar ni con qué volver a encontrarla: es
-      // peor callarlo que cortar acá.
-      throw new Error(
-        'La API aceptó el POST pero no devolvió el id de la automatización creada ' +
-          '(¿versión vieja de la API?). Revisá con `cce automations list`.',
-      );
-    }
-    return { id: assignedId, label, action: 'created', idGeneratedByServer: !id };
-  } catch (e) {
-    // Un fallo de transporte NO se reintenta por otra vía: el POST pudo haber
-    // llegado, y un PATCH detrás enturbiaría un estado ya dudoso.
-    if (!id || !isApiError(e) || !PATCH_WORTH_TRYING.has(e.status)) throw e;
-    postError = e;
-  }
+  const rejection = localRejection(item);
+  if (rejection) throw new Error(`${rejection} No se mandó nada.`);
 
-  // 409 = ya existe. 400 = el body no sirve para CREAR (le faltan requeridos),
-  // lo que no impide que sea un parche válido sobre algo que ya existe.
-  const { id: _ignored, ...body } = item;
+  const body = stripDerivedFlow(item, warnings);
+  const id = typeof body.id === 'string' ? body.id : '';
+  const creatable = REQUIRED_TO_CREATE.every((k) => body[k] !== undefined);
+
+  if (!id || creatable) {
+    try {
+      return await create(client, body, id, label);
+    } catch (e) {
+      // El 409 es la respuesta esperable de un upsert sobre algo que ya
+      // existe. Cualquier otro error es del caller: NO se prueba otra vía.
+      if (!id || !isApiError(e, 409)) throw e;
+    }
+  }
+  const { id: _path, ...patch } = body;
   try {
-    await client.patch(`/config/automations/${encodeURIComponent(id)}`, body);
+    await client.patch(`/config/automations/${encodeURIComponent(id)}`, patch);
   } catch (e) {
-    // El PATCH dice que no existe y el POST había rechazado el body: entonces
-    // el error de verdad es el del POST — el usuario quiso crear algo con un
-    // body incompleto, y decirle «no existe» lo manda a buscar donde no es.
-    if (isApiError(e, 404) && postError.status === 400) throw postError;
-    // Si el POST devolvió 409, el ValidationPipe ya había aceptado el body
-    // como `AutomationConfig`: un 400 del PATCH sobre ESE mismo body sólo
-    // puede venir de que su DTO valida más angosto.
-    if (postError.status === 409) throw explainPatchRejection(e);
-    throw e;
+    throw explainPatchRejection(e, patch);
   }
   return { id, label, action: 'updated', idGeneratedByServer: false };
 }
 
+async function create(
+  client: AutomationsHttp,
+  body: AutomationInput,
+  id: string,
+  label: string,
+): Promise<UpsertOutcome> {
+  const { data } = await client.post<CreateAutomationResponse>('/config/automations', body);
+  const assignedId = data?.automation?.id ?? id;
+  if (!assignedId) {
+    // La API respondió 2xx: la automatización EXISTE, sólo que no sabemos con
+    // qué id. Es estado desconocido, no un fallo limpio.
+    throw new UnknownStateError(
+      'La API aceptó el POST (la automatización se creó) pero no devolvió su id. ' +
+        'Buscala con `cce automations list` antes de volver a aplicar el archivo.',
+    );
+  }
+  return { id: assignedId, label, action: 'created', idGeneratedByServer: !id };
+}
+
 /**
- * El 400 de un PATCH cuyo body la API ya aceptó como `AutomationConfig` (el
- * POST devolvió 409) no puede ser culpa del archivo.
+ * El 400 del PATCH sobre un valor que el DTO ancho SÍ acepta no es culpa del
+ * archivo.
  *
- * `PatchAutomationDto` valida más angosto que el DTO del POST/PUT: hoy
+ * `PatchAutomationDto` valida más angosto que el de POST/PUT: hoy
  * `sourceAction: 'toggle'` —una forma que la API soporta a propósito y que el
  * PUT masivo aceptaba— da 400 por esta vía. Es un bug de la API
  * (EugeValeiras/CCE#109) que el CLI no puede arreglar, pero sí puede evitar que
- * se lea como "tenés el archivo mal".
+ * se lea como «tenés el archivo mal» y que el arreglo natural (cambiar el
+ * valor) altere lo que hace la automatización sin que nadie lo note.
  */
-function explainPatchRejection(e: unknown): unknown {
+function explainPatchRejection(e: unknown, body: AutomationInput): unknown {
   if (!isApiError(e, 400)) return e;
+  if (body.sourceAction !== 'toggle' || !/sourceAction/i.test(e.message)) return e;
   return new ApiError(
-    `${e.message} — ojo: la API ya aceptó este body al intentar crearlo, así que el ` +
-      'rechazo viene de que el DTO del PATCH valida más angosto que el del POST/PUT ' +
-      "(p. ej. sourceAction 'toggle'). Ver EugeValeiras/CCE#109.",
+    `${e.message} — pero 'toggle' ES válido para esta API: el DTO del PATCH valida más ` +
+      'angosto que el del POST/PUT. NO lo cambies a on/off (cambiarías lo que hace la ' +
+      'automatización): ver EugeValeiras/CCE#109.',
     e.status,
     e.data,
   );
@@ -310,6 +414,22 @@ export function readConfigVersion(headers?: Record<string, unknown>): string | u
   const raw = headers?.['x-config-version'];
   if (raw === undefined || raw === null || raw === '') return undefined;
   return String(raw);
+}
+
+/**
+ * Prepara el array del replace masivo: le quita el flujo derivado a cada item,
+ * por el mismo motivo que `create` (la API lo descarta igual, y mandarlo hace
+ * creer que se guardó). Devuelve el body a mandar y los avisos.
+ */
+export function prepareBulkAutomations(body: unknown): { body: unknown; warnings: string[] } {
+  if (!Array.isArray(body)) return { body, warnings: [] };
+  const warnings: string[] = [];
+  const items = body.map((a) =>
+    a && typeof a === 'object' && !Array.isArray(a)
+      ? stripDerivedFlow(a as AutomationInput, warnings)
+      : a,
+  );
+  return { body: items, warnings };
 }
 
 /**

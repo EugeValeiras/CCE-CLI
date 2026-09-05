@@ -1,8 +1,17 @@
 import { Command } from 'commander';
 import * as fs from 'fs';
 import ora from 'ora';
-import { createApiClient, isTransportError } from '../lib/api-client.js';
-import { Column, fail, info, printObject, printRows, success, warn } from '../lib/format.js';
+import { createApiClient } from '../lib/api-client.js';
+import {
+  Column,
+  fail,
+  note,
+  printObject,
+  printRows,
+  success,
+  successNote,
+  warn,
+} from '../lib/format.js';
 import { resolveFormat } from '../lib/user-config.js';
 import { countSteps, describeTriggers, renderAutomation } from '../lib/flow-format.js';
 import {
@@ -13,6 +22,7 @@ import {
   setAutomationEnabled,
   upsertAutomations,
 } from '../lib/automations-api.js';
+import { unknownStateMessage, warnIfStateUnknown } from '../lib/state-warning.js';
 import { Automation } from '../types/api.js';
 
 interface GlobalOpts {
@@ -180,8 +190,9 @@ function printUpsertReport(report: UpsertReport): void {
     report.applied.filter((o) => o.action === action).map((o) => o.id);
   const created = ids('created');
   const updated = ids('updated');
-  if (created.length) success(`Creadas (${created.length}): ${created.join(', ')}`);
-  if (updated.length) success(`Actualizadas (${updated.length}): ${updated.join(', ')}`);
+  // Todo el reporte por stderr: ver `successNote`.
+  if (created.length) successNote(`Creadas (${created.length}): ${created.join(', ')}`);
+  if (updated.length) successNote(`Actualizadas (${updated.length}): ${updated.join(', ')}`);
 
   // Los items que el archivo mandó SIN id: el que los escribió no tiene cómo
   // saber qué id les tocó, y son los únicos que reaplicar duplicaría.
@@ -197,52 +208,53 @@ function printUpsertReport(report: UpsertReport): void {
   for (const w of report.warnings) warn(w);
 
   if (!report.failed) {
-    if (!report.applied.length) info('El archivo no traía ninguna automatización.');
+    if (!report.applied.length) note('El archivo no traía ninguna automatización.');
     return;
   }
   fail(`Falló en ${report.failed.label}: ${report.failed.message}`);
-  // Un corte de transporte no dice si el servidor aplicó o no: es el único
-  // caso en que el CLI no sabe en qué estado quedó la casa, y callarlo
-  // convierte el reintento en un duplicado.
-  if (report.failed.stateUnknown) {
-    warn(
-      `Estado DESCONOCIDO de ${report.failed.label}: la petición salió y no hubo respuesta, ` +
-        'así que la API pudo haberla aplicado igual. Verificá con `cce automations list` ' +
-        'ANTES de reintentar.',
-    );
-  }
+  if (report.failed.stateUnknown) warn(unknownStateMessage(report.failed.label));
   if (report.notAttempted.length) {
-    warn(
-      `Sin intentar (${report.notAttempted.length}): ${report.notAttempted.join(', ')}`,
-    );
+    warn(`Sin intentar (${report.notAttempted.length}): ${report.notAttempted.join(', ')}`);
   }
-  info(retryAdvice(report));
+  note(retryAdvice(report));
 }
 
-/** Qué hacer después de un abort, que depende de si reaplicar duplica o no. */
+/**
+ * Qué hacer después de un abort.
+ *
+ * La pregunta que contesta es una sola: ¿reaplicar el archivo puede DUPLICAR
+ * algo? Duplican los items que entraron sin id (la API les acuñó uno que el
+ * archivo no tiene) y, si el corte dejó el estado en duda, también el item que
+ * cortó. El consejo los nombra a TODOS: acotar el riesgo a uno solo mientras
+ * el stderr enumera otros manda a re-POSTear justo lo que no hay que tocar.
+ */
 function retryAdvice(report: UpsertReport): string {
   const abort = report.applied.length
     ? 'Se abortó en el primer error; lo listado arriba YA quedó escrito.'
     : 'Se abortó en el primer item.';
   if (retryIsSafe(report)) {
-    const nada = report.applied.length ? '' : ' No quedó nada escrito.';
+    // «No quedó nada escrito» sólo se puede afirmar si el servidor contestó.
+    const nada = !report.applied.length && !report.failed?.stateUnknown
+      ? ' No quedó nada escrito.'
+      : '';
     return (
       `${abort}${nada} Corregí el archivo y reintentá: todo lo que se aplicó tiene id, ` +
       'así que volver a aplicarlo entero lo ACTUALIZA en vez de duplicarlo.'
     );
   }
+  const enRiesgo = report.applied.filter((o) => o.idGeneratedByServer).map((o) => o.id);
+  const partes: string[] = [];
+  if (enRiesgo.length) {
+    partes.push(`las que la API numeró (${enRiesgo.join(', ')})`);
+  }
   if (report.failed?.stateUnknown && !report.failed.hadId) {
-    return (
-      `${abort} El item que cortó no tiene id y no se sabe si entró: si entró y lo ` +
-      'reaplicás, queda DUPLICADO. Mirá `cce automations list` primero, y si ya está, ' +
-      'sacálo del archivo (o poneles el id que le tocó) antes de reintentar.'
-    );
+    partes.push(`el item que cortó (${report.failed.label}), que no se sabe si entró`);
   }
   return (
-    `${abort} NO reapliques el archivo tal cual: los items sin id que ya entraron se ` +
-    'crearían de nuevo con OTRO id (dos automatizaciones idénticas sobre el mismo ' +
-    'trigger). Sacálos del archivo, o poneles el id que les tocó (arriba), antes de ' +
-    'reintentar.'
+    `${abort} NO reapliques el archivo tal cual: ${partes.join(' y ')} se crearían de ` +
+    'nuevo con OTRO id (automatizaciones duplicadas sobre el mismo trigger). Mirá ' +
+    '`cce automations list`, sacá del archivo lo que ya esté —o poneles el id que les ' +
+    'tocó— y recién ahí reintentá.'
   );
 }
 
@@ -264,15 +276,4 @@ async function setEnabled(cmd: Command, id: string, enabled: boolean): Promise<v
   }
 }
 
-/**
- * Un fallo de transporte deja el estado en duda: la petición salió y nadie
- * contestó, así que la escritura pudo aplicarse igual. Decir sólo «falló»
- * invita a reintentar sobre una casa que ya cambió.
- */
-function warnIfStateUnknown(e: unknown, que: string): void {
-  if (!isTransportError(e)) return;
-  warn(
-    `Estado DESCONOCIDO: no hubo respuesta, así que ${que} pudo haberse aplicado igual. ` +
-      'Verificá con `cce automations list`.',
-  );
-}
+

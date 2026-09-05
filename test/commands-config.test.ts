@@ -154,11 +154,11 @@ test('set-remote automations: avisa que la API descarta flow/when en los items f
   );
 
   assert.equal(exitCode, 0, out);
-  // Sin el aviso, esto era un «✓ actualizada» sobre una edición descartada:
-  // el mismo agujero que `create`, por la otra puerta.
+  // Sin esto era un «✓ actualizada» sobre una edición descartada: el mismo
+  // agujero que `create`, por la otra puerta.
   assert.match(out, /flowDerived/);
-  assert.match(out, /NO se persiste/);
-  assert.equal(api.automations[0].flow, undefined, 'la API la descartó, como en producción');
+  assert.match(out, /se quitaron "flow"\/"when" del envío/);
+  assert.equal(api.automations[0].flow, undefined);
 });
 
 test('set-remote automations: sin flowDerived no hay ruido', async () => {
@@ -180,4 +180,105 @@ test('set-remote hue: --if-match se ignora y se dice', async () => {
   const { out } = await setRemote('{"bridgeIp":"1.2.3.4"}', 'config', 'set-remote', 'hue', '--if-match', '620');
 
   assert.match(out, /--if-match se ignora en \/hue/);
+});
+
+// ── la sección, tal como la resuelve el router ────────────────────────────
+
+test('set-remote Automations (con mayúscula) NO esquiva el guard del If-Match', async () => {
+  // Express enruta case-insensitive: `/config/Automations` llega al MISMO
+  // handler del replace masivo. Con la comparación exacta, esto se iba por el
+  // else y hacía el PUT sin If-Match — el vector del incidente, esquivando el
+  // único guard que hay.
+  const { out, exitCode } = await setRemote(
+    JSON.stringify([fullAutomation('auto_1')]),
+    'config',
+    'set-remote',
+    'Automations',
+  );
+
+  assert.equal(exitCode, 1);
+  assert.match(out, /Falta --if-match/);
+  assert.equal(puts().length, 0);
+});
+
+test('set-remote automations/ (con barra) tampoco', async () => {
+  const { out, exitCode } = await setRemote(
+    JSON.stringify([fullAutomation('auto_1')]),
+    'config',
+    'set-remote',
+    'automations/',
+  );
+
+  assert.equal(exitCode, 1);
+  assert.match(out, /Falta --if-match/);
+  assert.equal(puts().length, 0);
+});
+
+test('set-remote AUTOMATIONS con --if-match escribe por la ruta normalizada', async () => {
+  const { exitCode } = await setRemote(
+    JSON.stringify([fullAutomation('auto_1', { name: 'via mayúsculas' })]),
+    'config',
+    'set-remote',
+    'AUTOMATIONS',
+    '--if-match',
+    '620',
+  );
+
+  assert.equal(exitCode, 0);
+  assert.equal(puts()[0].path, '/api/config/automations');
+  assert.equal(puts()[0].ifMatch, '620');
+});
+
+test('show automations/ sugiere el comando con la sección normalizada', async () => {
+  const { out } = await run('config', 'show', 'automations/');
+
+  // Antes imprimía `set-remote automations/ --if-match 620`; ejecutarlo tal
+  // cual hacía el PUT sin protección.
+  assert.match(out, /set-remote automations --if-match 620/);
+  assert.doesNotMatch(out, /set-remote automations\/ /);
+});
+
+// ── el replace masivo también puede quedar en duda ────────────────────────
+
+test('set-remote: si la respuesta se pierde, avisa que pudo haberse aplicado', async () => {
+  api.killNext = { method: 'PUT' };
+
+  const { out, exitCode } = await setRemote(
+    JSON.stringify([fullAutomation('auto_1', { name: 'la que se escribió' })]),
+    'config',
+    'set-remote',
+    'automations',
+    '--if-match',
+    '620',
+  );
+
+  assert.equal(exitCode, 1);
+  assert.match(out, /Estado DESCONOCIDO/);
+  assert.match(out, /la escritura de \/automations/);
+  // Y de hecho se aplicó: reintentar con el mismo --if-match daría un 409 que
+  // el CLI narraría como «alguien más lo cambió» — siendo su propia escritura.
+  assert.equal(api.automations[0].name, 'la que se escribió');
+});
+
+test('set-remote: el flujo derivado se quita del BODY, no sólo se avisa', async () => {
+  const exportada = fullAutomation('auto_1', {
+    flowDerived: true,
+    flow: [{ type: 'do', actions: [] }],
+    when: [{ type: 'manual' }],
+  });
+
+  await setRemote(
+    JSON.stringify([exportada]),
+    'config',
+    'set-remote',
+    'automations',
+    '--if-match',
+    '620',
+  );
+
+  const enviado = (puts()[0].body as Record<string, unknown>[])[0];
+  assert.equal(enviado.flow, undefined);
+  assert.equal(enviado.when, undefined);
+  assert.equal(enviado.flowDerived, undefined);
+  assert.equal(enviado.name, 'auto auto_1');
 });

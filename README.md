@@ -102,44 +102,55 @@ automatización por llamada (`POST` / `PATCH` / `DELETE /api/config/automations/
 Ya no leen ni reenvían el array entero, así que no pueden pisar lo que la App o
 el Dashboard hayan escrito en el medio.
 
-- `create -f` es un **upsert**: por cada automatización del archivo manda un
-  `POST` y, si la API responde 409 porque el id ya existe, un `PATCH`. La salida
-  distingue creadas de actualizadas. Son hasta 2 llamadas por item (y un commit
-  server-side por cada una), así que un archivo de 20 no es una operación
-  barata ni instantánea para el resto de los clientes.
+- `create -f` es un **upsert**, y **la forma del body decide el método**:
+  - sin `id` → `POST` (la API acuña el id);
+  - con `id` y las cuatro claves que la API exige para crear
+    (`name`, `enabled`, `trigger`, `actions`) → `POST` y, si responde 409
+    porque ya existe, `PATCH`;
+  - con `id` y **forma parcial** (`{"id":"auto_1","enabled":false}`) → `PATCH`
+    directo, una sola llamada. Un 404 acá es «no existe», que es lo que pasó.
+
+  Nunca se cae al `PATCH` por un error del `POST`: el DTO del `PATCH` es todo
+  opcional, así que un body que el `POST` rechazó se escribiría igual, a medias.
 - El `PATCH` mergea **top-level**: un campo que el archivo no trae se
   **conserva** (antes, con el replace masivo, se borraba). Para vaciar una
   sección hay que mandarla explícitamente; y para cambiar algo anidado
   (`trigger.sensorTriggers[].sensorBindingId`) va el objeto `trigger` completo.
+- El CLI **se niega a mandar** tres cosas que la API acepta y después no puede
+  leer: un campo en `null` (el `PATCH` lo guarda y a partir de ahí toda lectura
+  de la config falla), una clave que la API no conoce (`"triger"` → la descarta
+  en silencio y guarda el resto, dejando la automatización a medio escribir; el
+  error sugiere la clave correcta), y un item que sólo trae `id` (un commit sin
+  cambios). En los tres casos no sale ninguna petición.
 - Con varias automatizaciones en el archivo el corte es **fail-fast**: al primer
   error se aborta y se informa qué quedó aplicado, dónde cortó y qué no se
-  intentó (exit ≠ 0).
+  intentó (exit ≠ 0). Todo el reporte sale por **stderr**, junto.
 - **Reaplicar el archivo corregido** es seguro para los items **con id** (el
   segundo intento los actualiza). Un item **sin id** NO es re-aplicable: cada
   `POST` acuña un id nuevo, así que volver a mandarlo crea un duplicado sobre el
   mismo trigger. Cuando eso pasa, el reporte lista los ids que acuñó la API y
   avisa de no reaplicar el archivo tal cual.
-- Si la corrida muere por **red** (timeout, conexión cortada), el estado queda
-  **desconocido**: la petición salió y el servidor pudo haberla aplicado igual.
-  El CLI lo dice y manda a verificar con `list` antes de reintentar, en vez de
-  dar por hecho que no se escribió.
-- Un **parche parcial** (`{"id":"auto_1","enabled":false}`) funciona: el `POST`
-  lo rechaza con 400 —`name`, `enabled`, `trigger` y `actions` son requeridos
-  para crear— y el CLI cae al `PATCH`, que sí acepta bodies parciales.
+- Si el CLI **no puede saber** si la escritura ocurrió —la conexión se cortó
+  después de mandar el pedido, la API devolvió 5xx (que puede llegar después de
+  guardar), o aceptó el `POST` sin decir con qué id— lo dice como **estado
+  desconocido** y manda a verificar con `list` antes de reintentar. Una API
+  caída (`ECONNREFUSED`) NO es eso: ahí no salió nada y el CLI lo afirma.
 - `delete`/`enable`/`disable` sobre un id inexistente fallan con el 404 de la
   API y exit ≠ 0.
 
 **Ojo con el flujo al re-aplicar un export.** `show --format json` estampa
 `"flowDerived": true` en toda automatización cuyo `flow` es la proyección del
-formato viejo — en esta casa, todas. La API **descarta `flow` y `when`** en los
-items que traen esa marca (para no persistir un flujo derivado que quedaría
-stale respecto de `actions`), así que exportar → editar el flujo → re-aplicar
-**no guarda la edición**. El CLI lo avisa; para que se persista hay que quitar
-`"flowDerived"` de ese item del archivo.
+formato viejo — en esta casa, todas. Ese flujo es de la API, no tuyo: el CLI
+**quita `flow`/`when` del envío** (la API los descartaría igual) y lo avisa, así
+que editar el flujo en un export y re-aplicarlo **no lo persiste**. Para
+escribir un flujo propio hay que mandarlo **sin la marca** `"flowDerived"` **y
+con las `actions` que le correspondan**: si mandás el flujo viejo junto a
+`actions` nuevas, el motor corre el flujo y el Dashboard muestra las actions.
 
 **Editar una automatización con `sourceAction: "toggle"`** falla hoy con 400: el
 DTO del `PATCH` de la API valida más angosto que el del `POST`/`PUT`
-(EugeValeiras/CCE#109). No es el archivo. El CLI lo señala en el mensaje.
+(EugeValeiras/CCE#109). No es el archivo, y **no hay que cambiarlo a `on`/`off`**
+—cambiaría lo que hace la automatización—: el CLI lo señala en el mensaje.
 
 ### `config`
 
@@ -173,8 +184,11 @@ el shell expande el `*` al primer archivo del directorio. El CLI valida que la
 versión sea un número (o `*`) antes de mandar nada, porque la API compara con
 `Number()` y devolvería el mismo 409 que una versión vieja.
 
-Este camino avisa del mismo descarte de `flow`/`when` que `create` cuando el
-JSON trae items con `"flowDerived": true`.
+Este camino le saca el flujo derivado a cada item igual que `create`, y avisa.
+
+La sección se normaliza antes de decidir nada: la API enruta sin distinguir
+mayúsculas ni la barra final, así que `Automations` y `automations/` son la
+misma ruta y también exigen `--if-match`.
 
 > Para mutaciones puntuales usá `cce automations` (item-level): no necesitan
 > versión porque no pueden pisar al resto del array.
