@@ -6,6 +6,142 @@ export interface ClientOptions {
   timeoutMs?: number;
 }
 
+/**
+ * CCE#107 — El error de la API, con el status a la vista.
+ *
+ * El interceptor siempre aplanó la respuesta a `Error('HTTP 409: ...')`: el
+ * mensaje quedaba legible pero el status sólo sobrevivía como texto, y ningún
+ * caller podía ramificar sin parsearlo con una regex. Los endpoints item-level
+ * de automations distinguen justo por status —409 «ya existe» es el pivote del
+ * upsert, 404 es «no existe»—, así que el status viaja como dato.
+ *
+ * `message` no cambia: lo que ya se imprimía se sigue imprimiendo igual.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/** true si `e` es un ApiError; con `status`, además, si es ESE status. */
+export function isApiError(e: unknown, status?: number): e is ApiError {
+  return e instanceof ApiError && (status === undefined || e.status === status);
+}
+
+/**
+ * CCE#107 — La petición no llegó a tener respuesta: timeout, conexión cortada,
+ * DNS, la API caída.
+ *
+ * La diferencia con `ApiError` no es cosmética: un status es la respuesta del
+ * servidor, o sea un estado CONOCIDO (409 = existe, 400 = no se guardó). Un
+ * error de transporte deja el estado DESCONOCIDO — un POST que muere por
+ * ECONNRESET pudo haberse aplicado igual, y la respuesta perderse de vuelta.
+ * Tratar eso como «no se escribió» es lo que convierte un reintento en un
+ * duplicado.
+ */
+export class TransportError extends Error {
+  constructor(
+    message: string,
+    readonly code: string | undefined,
+    /**
+     * Si la petición llegó a SALIR. Con `false` —la API caída, el host que no
+     * resuelve— no se escribió nada y decirlo es información dura; con `true`
+     * el pedido viajó y la respuesta se perdió, que es el único caso en que el
+     * cliente no puede saber en qué estado quedó la casa.
+     */
+    readonly sent: boolean,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'TransportError';
+  }
+}
+
+export function isTransportError(e: unknown): e is TransportError {
+  return e instanceof TransportError;
+}
+
+/**
+ * Códigos en los que la petición NO salió: no hubo con quién hablar. Todo lo
+ * demás (conexión cortada a mitad, timeout, pipe roto) pasó DESPUÉS de escribir
+ * el request, así que el servidor pudo haberlo aplicado.
+ */
+const NEVER_SENT = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EAI_AGAIN',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+  'CERT_HAS_EXPIRED',
+]);
+
+/**
+ * Si tras este error el estado del servidor quedó en duda.
+ *
+ * Son dos familias: la petición salió y no volvió respuesta, y el 5xx que puede
+ * llegar DESPUÉS de que la API ya guardó (un 502 del proxy si el upstream muere
+ * a mitad, o un 500 de un listener post-commit). En ambas, «no se escribió
+ * nada» es una afirmación que el cliente no puede hacer.
+ */
+export function isUnknownState(e: unknown): boolean {
+  if (isTransportError(e)) return e.sent;
+  if (isApiError(e)) return e.status >= 500;
+  return e instanceof UnknownStateError;
+}
+
+/**
+ * Para el caso raro pero real: la API respondió 2xx y aun así no se puede
+ * seguir (p. ej. un POST sin el id de lo que creó). La escritura ocurrió.
+ */
+export class UnknownStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnknownStateError';
+  }
+}
+
+/**
+ * El mensaje ÚTIL de un error de la API.
+ *
+ * Nest arma el body como `{ statusCode, message, error }`, donde `message` es
+ * lo que el handler escribió y `error` es la frase genérica del status. El
+ * interceptor leía `error`, así que TODO error del CLI se imprimía como
+ * «HTTP 404: Not Found» o «HTTP 400: Bad Request» — con el mensaje real
+ * («No existe la automatización auto_1», o qué campo rechazó el
+ * ValidationPipe) descartado en el camino.
+ *
+ * Los cuatro cuerpos que manda esta API:
+ *  - `{ message: 'No existe la automatización auto_1', error: 'Not Found' }`
+ *  - `{ message: ['sourceAction must be one of…'], error: 'Bad Request' }` (ValidationPipe)
+ *  - `{ message: 'Flujo inválido en …', errors: ['flow[0].then[1].cond: …'] }` (acceptFlow)
+ *  - `{ message: 'Config de automations stale: …', currentVersion: 621 }` (409 del PUT)
+ */
+export function apiErrorMessage(status: number, data: unknown): string {
+  const body = (typeof data === 'object' && data !== null ? data : {}) as Record<string, unknown>;
+  const parts: string[] = [];
+
+  const message = body.message;
+  if (typeof message === 'string' && message.trim()) parts.push(message.trim());
+  else if (Array.isArray(message) && message.length) parts.push(message.map(String).join('; '));
+  else if (typeof body.error === 'string' && body.error.trim()) parts.push(body.error.trim());
+  else if (typeof data === 'string' && data.trim()) parts.push(data.trim());
+  else if (data !== undefined && data !== null) parts.push(JSON.stringify(data));
+  else parts.push(`sin cuerpo (HTTP ${status})`);
+
+  // `errors` es la lista de rutas del validador de flujos: sin ella un
+  // «Flujo inválido» no dice QUÉ step está mal, que es lo único accionable.
+  const errors = body.errors;
+  if (Array.isArray(errors) && errors.length) parts.push(`(${errors.map(String).join('; ')})`);
+
+  return parts.join(' ');
+}
+
 export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
   const baseURL = `${resolveApiUrl(opts.apiUrl).replace(/\/$/, '')}/api`;
   const apiToken = resolveApiToken();
@@ -22,13 +158,28 @@ export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
     (err) => {
       if (err.response) {
         const { status, data } = err.response;
-        const msg = typeof data === 'object' && data?.error ? data.error : JSON.stringify(data);
-        return Promise.reject(new Error(`HTTP ${status}: ${msg}`));
+        return Promise.reject(
+          new ApiError(`HTTP ${status}: ${apiErrorMessage(status, data)}`, status, data),
+        );
       }
       if (err.code === 'ECONNREFUSED') {
-        return Promise.reject(new Error(`Cannot reach CCE API at ${baseURL}. Is it running?`));
+        return Promise.reject(
+          new TransportError(
+            `Cannot reach CCE API at ${baseURL}. Is it running?`,
+            err.code,
+            false,
+            err,
+          ),
+        );
       }
-      return Promise.reject(err);
+      return Promise.reject(
+        new TransportError(
+          `${err.message ?? 'fallo de red'} (${err.code ?? 'sin código'}) contra ${baseURL}`,
+          err.code,
+          !NEVER_SENT.has(String(err.code)),
+          err,
+        ),
+      );
     },
   );
   return client;
