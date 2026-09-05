@@ -1,6 +1,11 @@
 import { Command } from 'commander';
 import { createApiClient } from '../lib/api-client.js';
-import { readConfigVersion, replaceAllAutomations } from '../lib/automations-api.js';
+import {
+  AutomationInput,
+  derivedFlowWarnings,
+  readConfigVersion,
+  replaceAllAutomations,
+} from '../lib/automations-api.js';
 import { fail, info, note, printObject, success, warn } from '../lib/format.js';
 import {
   getConfigPath,
@@ -106,6 +111,11 @@ export function registerConfigCommand(program: Command): void {
         // If-Match tomado de un GET de recién coincide siempre y no protege de
         // nada. Ver `replaceAllAutomations`.
         if (section === 'automations') {
+          // El mismo no-op silencioso que `cce automations create`, por la otra
+          // puerta: la API descarta flow/when en los items flowDerived y
+          // responde 200 igual. Se avisa ANTES de escribir, porque después el
+          // «✓ actualizada» ya se leyó como que la edición entró.
+          for (const w of derivedFlowWarnings(asAutomationList(body))) warn(w);
           await replaceAllAutomations(client, body, opts.ifMatch ?? '');
         } else {
           if (opts.ifMatch) {
@@ -129,6 +139,12 @@ export function registerConfigCommand(program: Command): void {
       info(`Config en ${getConfigPath()}`);
       printObject(maskToken(cfg), 'json');
     });
+}
+
+/** El body de `set-remote automations`, si tiene forma de lista de automatizaciones. */
+function asAutomationList(body: unknown): AutomationInput[] {
+  if (!Array.isArray(body)) return [];
+  return body.filter((a): a is AutomationInput => typeof a === 'object' && a !== null);
 }
 
 function maskToken(cfg: UserConfig): UserConfig {

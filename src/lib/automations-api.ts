@@ -1,5 +1,5 @@
 import { Automation } from '../types/api.js';
-import { ApiError, isApiError } from './api-client.js';
+import { ApiError, isApiError, isTransportError } from './api-client.js';
 
 /**
  * CCE#107 — Las escrituras de automatizaciones, item por item.
@@ -13,8 +13,9 @@ import { ApiError, isApiError } from './api-client.js';
  *
  * Los endpoints item-level (POST/PATCH/DELETE) no pueden pisar al resto del
  * array por construcción: la API toca UNA automatización y deja las otras 21
- * como estén. Por eso acá no hay ningún read-modify-write; el estado previo
- * que hace falta consultar lo consulta el server.
+ * como estén. Por eso `AutomationsHttp` ni siquiera declara `get`: que no haya
+ * forma de leer el array desde acá hace que el read-modify-write no pueda
+ * volver por descuido — el compilador lo impide.
  *
  * La lógica vive separada de `commands/automations.ts` para que sea testeable
  * con un cliente HTTP falso: lo que hay que poder afirmar de estas operaciones
@@ -24,16 +25,14 @@ import { ApiError, isApiError } from './api-client.js';
 /** Una respuesta HTTP, en lo mínimo que estas operaciones miran. */
 export interface HttpResponse<T = unknown> {
   data: T;
-  headers?: Record<string, unknown>;
 }
 
 /**
- * Lo mínimo que estas operaciones necesitan de un cliente HTTP. Un
- * `AxiosInstance` lo cumple; un objeto de test que registra método y ruta,
- * también.
+ * Lo mínimo que estas operaciones necesitan de un cliente HTTP — sin `get`, a
+ * propósito (ver arriba). Un `AxiosInstance` lo cumple; un objeto de test que
+ * registra método y ruta, también.
  */
 export interface AutomationsHttp {
-  get<T = unknown>(url: string, config?: unknown): Promise<HttpResponse<T>>;
   post<T = unknown>(url: string, body?: unknown, config?: unknown): Promise<HttpResponse<T>>;
   patch<T = unknown>(url: string, body?: unknown, config?: unknown): Promise<HttpResponse<T>>;
   put<T = unknown>(url: string, body?: unknown, config?: unknown): Promise<HttpResponse<T>>;
@@ -67,6 +66,18 @@ export interface UpsertOutcome {
   idGeneratedByServer: boolean;
 }
 
+export interface UpsertFailure {
+  label: string;
+  message: string;
+  /** Si el archivo traía id para este item. */
+  hadId: boolean;
+  /**
+   * true cuando el error fue de TRANSPORTE y no una respuesta del servidor: la
+   * escritura pudo haberse aplicado igual. Ver `TransportError`.
+   */
+  stateUnknown: boolean;
+}
+
 /**
  * Qué pasó con un `create` de N automatizaciones.
  *
@@ -80,13 +91,13 @@ export interface UpsertOutcome {
  * (401, API caída): insistir sólo multiplica el ruido.
  *
  * Lo que NO puede pasar —y por eso este reporte existe— es que falle en
- * silencio: `applied` dice qué quedó escrito, `failed` en cuál cortó y por
- * qué, `notAttempted` qué ni se intentó, y `warnings` lo que la API aceptó
- * pero no persistió como el archivo pretendía.
+ * silencio: `applied` dice qué quedó escrito, `failed` en cuál cortó, por qué y
+ * si el estado quedó en duda, `notAttempted` qué ni se intentó, y `warnings` lo
+ * que la API aceptó pero no persistió como el archivo pretendía.
  */
 export interface UpsertReport {
   applied: UpsertOutcome[];
-  failed?: { label: string; message: string };
+  failed?: UpsertFailure;
   notAttempted: string[];
   warnings: string[];
 }
@@ -102,29 +113,42 @@ export function labelOf(item: AutomationInput): string {
  * Si reaplicar el archivo entero después de un fallo es seguro.
  *
  * El upsert es idempotente SÓLO para items con id: ahí el segundo intento
- * encuentra el 409 y hace PATCH. Un item SIN id no lo es — cada POST acuña un
- * id nuevo, así que reaplicar crea un DUPLICADO de lo que ya entró, y la casa
- * queda con dos automatizaciones idénticas disparando sobre el mismo trigger.
- * Decir "reintentá tranquilo" en ese caso es un consejo que rompe cosas.
+ * encuentra el existente y lo actualiza. Un item SIN id no lo es — cada POST
+ * acuña un id nuevo, así que reaplicar crea un DUPLICADO de lo que ya entró, y
+ * la casa queda con dos automatizaciones idénticas disparando sobre el mismo
+ * trigger. Decir "reintentá tranquilo" en ese caso es un consejo que rompe
+ * cosas.
+ *
+ * Un corte por transporte sobre un item SIN id cae en la misma trampa: no se
+ * sabe si entró, así que reintentar puede duplicarlo igual.
  */
 export function retryIsSafe(report: UpsertReport): boolean {
-  return !report.applied.some((o) => o.idGeneratedByServer);
+  if (report.applied.some((o) => o.idGeneratedByServer)) return false;
+  if (report.failed?.stateUnknown && !report.failed.hadId) return false;
+  return true;
 }
 
 /**
  * Crea o actualiza cada automatización del archivo, una por llamada.
  *
- * `create` sigue siendo UPSERT (POST y, si la API responde 409 porque el id ya
- * existe, PATCH). No es inercia: hoy el comando se usa para editar
- * automatizaciones existentes desde un archivo —exportar con `show --format
- * json`, editar, volver a aplicar— y convertirlo en error rompería ese flujo
- * sin dar nada a cambio.
+ * `create` es UPSERT: hoy el comando se usa para editar automatizaciones
+ * existentes desde un archivo —exportar con `show --format json`, editar,
+ * volver a aplicar— y convertirlo en error rompería ese flujo sin dar nada a
+ * cambio.
  *
- * El orden POST→PATCH (y no PATCH→POST, que ahorraría un round-trip en el caso
- * común) es deliberado: el DTO del PATCH valida MÁS ANGOSTO que el del POST
- * (EugeValeiras/CCE#109), así que probar con PATCH primero haría fallar con 400
- * altas perfectamente válidas. Mientras esa asimetría exista, las creaciones no
- * pueden pasar por el PATCH.
+ * El orden es POST y, si no se pudo crear, PATCH. Que sea POST-first y no
+ * PATCH-first es deliberado: el DTO del PATCH valida MÁS ANGOSTO que el del
+ * POST (EugeValeiras/CCE#109 — `sourceAction: 'toggle'` es válido para crear y
+ * da 400 al parchear), así que probar con PATCH primero haría fallar altas
+ * perfectamente válidas. Mientras esa asimetría exista, una creación no puede
+ * pasar por el PATCH.
+ *
+ * La contracara es que el POST valida el body COMPLETO (`name`, `enabled`,
+ * `trigger` y `actions` son requeridos en `AutomationConfig`), así que un
+ * parche parcial —`{id, enabled:false}`— se lleva un 400 del ValidationPipe
+ * ANTES de que el handler pueda responder 409. Por eso el fallback al PATCH
+ * cubre 409 (ya existe) y también 400 (no sirve para crear, pero puede ser un
+ * parche válido sobre algo que ya existe): ver `upsertOne`.
  *
  * Diferencia real respecto del PUT masivo, y vale conocerla: el PATCH mergea
  * TOP-LEVEL, así que un campo que el archivo NO trae se conserva en vez de
@@ -136,24 +160,33 @@ export async function upsertAutomations(
   items: AutomationInput[],
 ): Promise<UpsertReport> {
   const applied: UpsertOutcome[] = [];
-  const warnings = derivedFlowWarnings(items);
+  // Los avisos se calculan sobre lo que se INTENTÓ, no sobre el archivo
+  // entero: tras un abort, avisar de items que nunca salieron es ruido que
+  // manda a revisar el lugar equivocado.
+  const attempted: AutomationInput[] = [];
   for (let i = 0; i < items.length; i++) {
+    attempted.push(items[i]);
     try {
       applied.push(await upsertOne(client, items[i]));
     } catch (e) {
       return {
         applied,
-        failed: { label: labelOf(items[i]), message: (e as Error).message },
+        failed: {
+          label: labelOf(items[i]),
+          message: (e as Error).message,
+          hadId: Boolean(items[i]?.id),
+          stateUnknown: isTransportError(e),
+        },
         notAttempted: items.slice(i + 1).map(labelOf),
-        warnings,
+        warnings: derivedFlowWarnings(attempted),
       };
     }
   }
-  return { applied, notAttempted: [], warnings };
+  return { applied, notAttempted: [], warnings: derivedFlowWarnings(attempted) };
 }
 
 /**
- * El aviso del no-op silencioso más caro que tiene este comando.
+ * El aviso del no-op silencioso más caro que tienen estos comandos.
  *
  * `show --format json` estampa `flowDerived: true` en toda automatización cuyo
  * `flow` es la PROYECCIÓN del formato viejo — que en esta casa son todas. Al
@@ -167,19 +200,25 @@ export async function upsertAutomations(
  * archivo fue editado o es la proyección tal como salió, y quitarlo a ciegas
  * haría que la API persista un flujo derivado — el problema que la marca
  * existe para evitar. La decisión es del que editó, y acá se le dice cómo.
+ *
+ * Se exporta porque el replace masivo (`config set-remote automations`) manda
+ * los mismos objetos por otra puerta y se come el mismo no-op.
  */
-function derivedFlowWarnings(items: AutomationInput[]): string[] {
+export function derivedFlowWarnings(items: AutomationInput[]): string[] {
   const marked = items.filter(
     (a) => a?.flowDerived === true && (a.flow !== undefined || a.when !== undefined),
   );
   if (!marked.length) return [];
   return [
-    `${marked.length} automatización(es) del archivo vienen con "flowDerived": true ` +
+    `${marked.length} automatización(es) vienen con "flowDerived": true ` +
       `(${marked.map(labelOf).join(', ')}): la API DESCARTA "flow" y "when" en esos items ` +
       'y guarda el resto, así que una edición del flujo NO se persiste. Si editaste el ' +
-      'flujo, quitá "flowDerived" de ese item del archivo y volvé a aplicarlo.',
+      'flujo, quitá "flowDerived" de ese item y volvé a aplicarlo.',
   ];
 }
+
+/** Los status del POST tras los cuales todavía puede haber un PATCH que sirva. */
+const PATCH_WORTH_TRYING = new Set([400, 409]);
 
 async function upsertOne(
   client: AutomationsHttp,
@@ -187,6 +226,7 @@ async function upsertOne(
 ): Promise<UpsertOutcome> {
   const id = typeof item?.id === 'string' ? item.id : '';
   const label = labelOf(item);
+  let postError: ApiError;
   try {
     const { data } = await client.post<CreateAutomationResponse>('/config/automations', item);
     const assignedId = data?.automation?.id ?? id;
@@ -200,21 +240,34 @@ async function upsertOne(
     }
     return { id: assignedId, label, action: 'created', idGeneratedByServer: !id };
   } catch (e) {
-    // 409 es la respuesta esperable de un upsert sobre algo que ya existe; el
-    // resto de los errores (400 de validación, 401, red) son del caller.
-    if (!id || !isApiError(e, 409)) throw e;
-    const { id: _ignored, ...body } = item;
-    try {
-      await client.patch(`/config/automations/${encodeURIComponent(id)}`, body);
-    } catch (patchError) {
-      throw explainPatchRejection(patchError);
-    }
-    return { id, label, action: 'updated', idGeneratedByServer: false };
+    // Un fallo de transporte NO se reintenta por otra vía: el POST pudo haber
+    // llegado, y un PATCH detrás enturbiaría un estado ya dudoso.
+    if (!id || !isApiError(e) || !PATCH_WORTH_TRYING.has(e.status)) throw e;
+    postError = e;
   }
+
+  // 409 = ya existe. 400 = el body no sirve para CREAR (le faltan requeridos),
+  // lo que no impide que sea un parche válido sobre algo que ya existe.
+  const { id: _ignored, ...body } = item;
+  try {
+    await client.patch(`/config/automations/${encodeURIComponent(id)}`, body);
+  } catch (e) {
+    // El PATCH dice que no existe y el POST había rechazado el body: entonces
+    // el error de verdad es el del POST — el usuario quiso crear algo con un
+    // body incompleto, y decirle «no existe» lo manda a buscar donde no es.
+    if (isApiError(e, 404) && postError.status === 400) throw postError;
+    // Si el POST devolvió 409, el ValidationPipe ya había aceptado el body
+    // como `AutomationConfig`: un 400 del PATCH sobre ESE mismo body sólo
+    // puede venir de que su DTO valida más angosto.
+    if (postError.status === 409) throw explainPatchRejection(e);
+    throw e;
+  }
+  return { id, label, action: 'updated', idGeneratedByServer: false };
 }
 
 /**
- * El 400 del PATCH puede no ser culpa del archivo.
+ * El 400 de un PATCH cuyo body la API ya aceptó como `AutomationConfig` (el
+ * POST devolvió 409) no puede ser culpa del archivo.
  *
  * `PatchAutomationDto` valida más angosto que el DTO del POST/PUT: hoy
  * `sourceAction: 'toggle'` —una forma que la API soporta a propósito y que el
@@ -225,9 +278,9 @@ async function upsertOne(
 function explainPatchRejection(e: unknown): unknown {
   if (!isApiError(e, 400)) return e;
   return new ApiError(
-    `${e.message} — ojo: el DTO del PATCH de la API valida más angosto que el del ` +
-      "POST/PUT (p. ej. sourceAction 'toggle'), así que un body válido puede ser " +
-      'rechazado por esta vía. Ver EugeValeiras/CCE#109.',
+    `${e.message} — ojo: la API ya aceptó este body al intentar crearlo, así que el ` +
+      'rechazo viene de que el DTO del PATCH valida más angosto que el del POST/PUT ' +
+      "(p. ej. sourceAction 'toggle'). Ver EugeValeiras/CCE#109.",
     e.status,
     e.data,
   );
@@ -284,6 +337,18 @@ export async function replaceAllAutomations(
         'lectura que editaste no hay forma de saber si alguien escribió en el medio.\n' +
         '  cce config show automations   # imprime la versión (y el JSON a editar)\n' +
         '  … | cce config set-remote automations --if-match <version>',
+    );
+  }
+  // La API compara con `Number(If-Match)`: cualquier cosa que no sea un número
+  // da NaN y responde el MISMO 409 que una versión stale. Sin este chequeo, un
+  // `--if-match *` sin comillas —que el shell expande al primer archivo del
+  // directorio— se reportaría como «la config cambió desde la versión
+  // autos.json», que manda a investigar un problema que no existe.
+  if (!/^\d+$/.test(version) && version !== '*') {
+    throw new Error(
+      `--if-match inválido: "${version}". Tiene que ser el número de versión que imprime ` +
+        '`cce config show automations`, o `*` para escribir sin chequeo.\n' +
+        "Ojo: en bash/zsh el * sin comillas lo expande el shell — usá '*'.",
     );
   }
   try {

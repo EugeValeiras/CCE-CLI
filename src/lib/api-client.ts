@@ -34,6 +34,32 @@ export function isApiError(e: unknown, status?: number): e is ApiError {
 }
 
 /**
+ * CCE#107 — La petición no llegó a tener respuesta: timeout, conexión cortada,
+ * DNS, la API caída.
+ *
+ * La diferencia con `ApiError` no es cosmética: un status es la respuesta del
+ * servidor, o sea un estado CONOCIDO (409 = existe, 400 = no se guardó). Un
+ * error de transporte deja el estado DESCONOCIDO — un POST que muere por
+ * ECONNRESET pudo haberse aplicado igual, y la respuesta perderse de vuelta.
+ * Tratar eso como «no se escribió» es lo que convierte un reintento en un
+ * duplicado.
+ */
+export class TransportError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'TransportError';
+  }
+}
+
+export function isTransportError(e: unknown): e is TransportError {
+  return e instanceof TransportError;
+}
+
+/**
  * El mensaje ÚTIL de un error de la API.
  *
  * Nest arma el body como `{ statusCode, message, error }`, donde `message` es
@@ -90,9 +116,23 @@ export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
         );
       }
       if (err.code === 'ECONNREFUSED') {
-        return Promise.reject(new Error(`Cannot reach CCE API at ${baseURL}. Is it running?`));
+        return Promise.reject(
+          new TransportError(
+            `Cannot reach CCE API at ${baseURL}. Is it running?`,
+            err.code,
+            err,
+          ),
+        );
       }
-      return Promise.reject(err);
+      // Timeout, conexión cortada, DNS: la petición SALIÓ y no sabemos si el
+      // servidor la aplicó. Ver `TransportError`.
+      return Promise.reject(
+        new TransportError(
+          `${err.message ?? 'fallo de red'} (${err.code ?? 'sin código'}) contra ${baseURL}`,
+          err.code,
+          err,
+        ),
+      );
     },
   );
   return client;

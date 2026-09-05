@@ -119,6 +119,13 @@ el Dashboard hayan escrito en el medio.
   `POST` acuña un id nuevo, así que volver a mandarlo crea un duplicado sobre el
   mismo trigger. Cuando eso pasa, el reporte lista los ids que acuñó la API y
   avisa de no reaplicar el archivo tal cual.
+- Si la corrida muere por **red** (timeout, conexión cortada), el estado queda
+  **desconocido**: la petición salió y el servidor pudo haberla aplicado igual.
+  El CLI lo dice y manda a verificar con `list` antes de reintentar, en vez de
+  dar por hecho que no se escribió.
+- Un **parche parcial** (`{"id":"auto_1","enabled":false}`) funciona: el `POST`
+  lo rechaza con 400 —`name`, `enabled`, `trigger` y `actions` son requeridos
+  para crear— y el CLI cae al `PATCH`, que sí acepta bodies parciales.
 - `delete`/`enable`/`disable` sobre un id inexistente fallan con el 404 de la
   API y exit ≠ 0.
 
@@ -160,7 +167,14 @@ una de recién: si la App creó algo mientras editabas, la API responde 409, no 
 escribe nada, y el CLI dice con qué versión reintentar. Un `If-Match` tomado de
 un `GET` hecho al momento de escribir coincidiría siempre y no protegería de
 nada — que es exactamente el incidente que este chequeo existe para evitar.
-`--if-match '*'` escribe sin chequeo, a tu riesgo.
+
+`--if-match '*'` escribe sin chequeo, a tu riesgo — **con comillas**: sin ellas
+el shell expande el `*` al primer archivo del directorio. El CLI valida que la
+versión sea un número (o `*`) antes de mandar nada, porque la API compara con
+`Number()` y devolvería el mismo 409 que una versión vieja.
+
+Este camino avisa del mismo descarte de `flow`/`when` que `create` cuando el
+JSON trae items con `"flowDerived": true`.
 
 > Para mutaciones puntuales usá `cce automations` (item-level): no necesitan
 > versión porque no pueden pisar al resto del array.

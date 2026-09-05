@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import * as fs from 'fs';
 import ora from 'ora';
-import { createApiClient } from '../lib/api-client.js';
+import { createApiClient, isTransportError } from '../lib/api-client.js';
 import { Column, fail, info, printObject, printRows, success, warn } from '../lib/format.js';
 import { resolveFormat } from '../lib/user-config.js';
 import { countSteps, describeTriggers, renderAutomation } from '../lib/flow-format.js';
@@ -158,6 +158,7 @@ export function registerAutomationsCommand(program: Command): void {
         success(`Eliminada: ${id}`);
       } catch (e) {
         fail((e as Error).message);
+        warnIfStateUnknown(e, `el borrado de ${id}`);
         process.exitCode = 1;
       }
     });
@@ -169,13 +170,12 @@ export function registerAutomationsCommand(program: Command): void {
  * dato: decía lo mismo al dar de alta algo nuevo que al pisar una automatización
  * que ya existía.
  *
- * Si hubo un error, el reporte también dice dónde cortó, qué no se intentó y si
- * reaplicar el archivo es seguro: item por item no hay "todo o nada", así que
- * dejar el corte implícito sería el fallo silencioso que este cambio viene a
- * evitar. Se exporta para poder testear el reporte, que es la mitad del
- * contrato del fail-fast.
+ * Si hubo un error, el reporte también dice dónde cortó, qué no se intentó, si
+ * el estado quedó en duda y si reaplicar el archivo es seguro: item por item no
+ * hay "todo o nada", así que dejar el corte implícito sería el fallo silencioso
+ * que este cambio viene a evitar.
  */
-export function printUpsertReport(report: UpsertReport): void {
+function printUpsertReport(report: UpsertReport): void {
   const ids = (action: 'created' | 'updated'): string[] =>
     report.applied.filter((o) => o.action === action).map((o) => o.id);
   const created = ids('created');
@@ -201,6 +201,16 @@ export function printUpsertReport(report: UpsertReport): void {
     return;
   }
   fail(`Falló en ${report.failed.label}: ${report.failed.message}`);
+  // Un corte de transporte no dice si el servidor aplicó o no: es el único
+  // caso en que el CLI no sabe en qué estado quedó la casa, y callarlo
+  // convierte el reintento en un duplicado.
+  if (report.failed.stateUnknown) {
+    warn(
+      `Estado DESCONOCIDO de ${report.failed.label}: la petición salió y no hubo respuesta, ` +
+        'así que la API pudo haberla aplicado igual. Verificá con `cce automations list` ' +
+        'ANTES de reintentar.',
+    );
+  }
   if (report.notAttempted.length) {
     warn(
       `Sin intentar (${report.notAttempted.length}): ${report.notAttempted.join(', ')}`,
@@ -211,21 +221,28 @@ export function printUpsertReport(report: UpsertReport): void {
 
 /** Qué hacer después de un abort, que depende de si reaplicar duplica o no. */
 function retryAdvice(report: UpsertReport): string {
-  if (!report.applied.length) {
-    return 'Se abortó en el primer item: no quedó nada escrito. Corregí el archivo y reintentá.';
-  }
+  const abort = report.applied.length
+    ? 'Se abortó en el primer error; lo listado arriba YA quedó escrito.'
+    : 'Se abortó en el primer item.';
   if (retryIsSafe(report)) {
+    const nada = report.applied.length ? '' : ' No quedó nada escrito.';
     return (
-      'Se abortó en el primer error; lo listado arriba YA quedó escrito. Corregí el ' +
-      'archivo y reintentá: todos los items aplicados tienen id, así que volver a ' +
-      'aplicarlo entero los ACTUALIZA en vez de duplicarlos.'
+      `${abort}${nada} Corregí el archivo y reintentá: todo lo que se aplicó tiene id, ` +
+      'así que volver a aplicarlo entero lo ACTUALIZA en vez de duplicarlo.'
+    );
+  }
+  if (report.failed?.stateUnknown && !report.failed.hadId) {
+    return (
+      `${abort} El item que cortó no tiene id y no se sabe si entró: si entró y lo ` +
+      'reaplicás, queda DUPLICADO. Mirá `cce automations list` primero, y si ya está, ' +
+      'sacálo del archivo (o poneles el id que le tocó) antes de reintentar.'
     );
   }
   return (
-    'Se abortó en el primer error; lo listado arriba YA quedó escrito. NO reapliques el ' +
-    'archivo tal cual: los items sin id que ya entraron se crearían de nuevo con OTRO id ' +
-    '(dos automatizaciones idénticas sobre el mismo trigger). Sacálos del archivo, o ' +
-    'poneles el id que les tocó (arriba), antes de reintentar.'
+    `${abort} NO reapliques el archivo tal cual: los items sin id que ya entraron se ` +
+    'crearían de nuevo con OTRO id (dos automatizaciones idénticas sobre el mismo ' +
+    'trigger). Sacálos del archivo, o poneles el id que les tocó (arriba), antes de ' +
+    'reintentar.'
   );
 }
 
@@ -242,6 +259,20 @@ async function setEnabled(cmd: Command, id: string, enabled: boolean): Promise<v
   } catch (e) {
     spinner.stop();
     fail((e as Error).message);
+    warnIfStateUnknown(e, `el cambio sobre ${id}`);
     process.exitCode = 1;
   }
+}
+
+/**
+ * Un fallo de transporte deja el estado en duda: la petición salió y nadie
+ * contestó, así que la escritura pudo aplicarse igual. Decir sólo «falló»
+ * invita a reintentar sobre una casa que ya cambió.
+ */
+function warnIfStateUnknown(e: unknown, que: string): void {
+  if (!isTransportError(e)) return;
+  warn(
+    `Estado DESCONOCIDO: no hubo respuesta, así que ${que} pudo haberse aplicado igual. ` +
+      'Verificá con `cce automations list`.',
+  );
 }
