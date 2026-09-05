@@ -25,6 +25,14 @@ Desarrollo con recarga:
 npm run start:dev -- devices list
 ```
 
+Tests (`node:test` sobre `tsx`, con el cliente HTTP falso — nunca pegan a una
+API real) y chequeo de tipos de `src/` + `test/`:
+
+```bash
+npm test
+npm run typecheck
+```
+
 ## Configuración
 
 El CLI lee config de (en orden de prioridad):
@@ -89,6 +97,25 @@ cce automations delete auto_1
 > `automations run` ejecuta las acciones cliente-side contra `/devices/:id/state`.
 > Actions `notification` y `alarm` se saltean (requieren ejecución server-side).
 
+**Escrituras item-level.** `create`, `delete`, `enable` y `disable` tocan UNA
+automatización por llamada (`POST` / `PATCH` / `DELETE /api/config/automations/:id`).
+Ya no leen ni reenvían el array entero, así que no pueden pisar lo que la App o
+el Dashboard hayan escrito en el medio.
+
+- `create -f` es un **upsert**: por cada automatización del archivo manda un
+  `POST` y, si la API responde 409 porque el id ya existe, un `PATCH`. La salida
+  distingue creadas de actualizadas.
+- El `PATCH` mergea **top-level**: un campo que el archivo no trae se
+  **conserva** (antes, con el replace masivo, se borraba). Para vaciar una
+  sección hay que mandarla explícitamente; y para cambiar algo anidado
+  (`trigger.sensorTriggers[].sensorBindingId`) va el objeto `trigger` completo.
+- Con varias automatizaciones en el archivo el corte es **fail-fast**: al primer
+  error se aborta y se informa qué quedó aplicado, dónde cortó y qué no se
+  intentó (exit ≠ 0). Reaplicar el archivo entero después de corregirlo es
+  seguro: el upsert es idempotente.
+- `delete`/`enable`/`disable` sobre un id inexistente fallan con el 404 de la
+  API y exit ≠ 0.
+
 ### `config`
 
 ```bash
@@ -100,6 +127,11 @@ cce config local             # config local (~/.cce/config.json)
 cce config set <keyPath> <value>   # dot notation
 cce config unset <keyPath>
 ```
+
+> `config set-remote automations` es el único replace masivo que queda en el
+> CLI, y va con `If-Match` de la versión del `GET` previo: si alguien escribió
+> en el medio, la API responde 409, no se escribe nada y el CLI lo explica.
+> Para mutaciones puntuales usá `cce automations` (item-level).
 
 ### `events live`
 

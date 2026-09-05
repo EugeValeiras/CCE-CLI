@@ -1,5 +1,5 @@
 # CI — CCE-CLI (Node/TS, Node 24)
-# Gate: npm ci + build (tsc). No hay tests todavía.
+# Gate: npm ci + build (tsc) + tests (node:test sobre tsx).
 name: CI
 
 on:
@@ -23,3 +23,6 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Test
+        run: npm test

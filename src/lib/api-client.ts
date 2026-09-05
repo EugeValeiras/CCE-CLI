@@ -6,6 +6,33 @@ export interface ClientOptions {
   timeoutMs?: number;
 }
 
+/**
+ * CCE#107 — El error de la API, con el status a la vista.
+ *
+ * El interceptor siempre aplanó la respuesta a `Error('HTTP 409: ...')`: el
+ * mensaje quedaba legible pero el status sólo sobrevivía como texto, y ningún
+ * caller podía ramificar sin parsearlo con una regex. Los endpoints item-level
+ * de automations distinguen justo por status —409 «ya existe» es el pivote del
+ * upsert, 404 es «no existe»—, así que el status viaja como dato.
+ *
+ * `message` no cambia: lo que ya se imprimía se sigue imprimiendo igual.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/** true si `e` es un ApiError; con `status`, además, si es ESE status. */
+export function isApiError(e: unknown, status?: number): e is ApiError {
+  return e instanceof ApiError && (status === undefined || e.status === status);
+}
+
 export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
   const baseURL = `${resolveApiUrl(opts.apiUrl).replace(/\/$/, '')}/api`;
   const apiToken = resolveApiToken();
@@ -23,7 +50,7 @@ export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
       if (err.response) {
         const { status, data } = err.response;
         const msg = typeof data === 'object' && data?.error ? data.error : JSON.stringify(data);
-        return Promise.reject(new Error(`HTTP ${status}: ${msg}`));
+        return Promise.reject(new ApiError(`HTTP ${status}: ${msg}`, status, data));
       }
       if (err.code === 'ECONNREFUSED') {
         return Promise.reject(new Error(`Cannot reach CCE API at ${baseURL}. Is it running?`));

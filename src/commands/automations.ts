@@ -2,9 +2,16 @@ import { Command } from 'commander';
 import * as fs from 'fs';
 import ora from 'ora';
 import { createApiClient } from '../lib/api-client.js';
-import { Column, fail, printObject, printRows, success } from '../lib/format.js';
+import { Column, fail, info, printObject, printRows, success, warn } from '../lib/format.js';
 import { resolveFormat } from '../lib/user-config.js';
 import { countSteps, describeTriggers, renderAutomation } from '../lib/flow-format.js';
+import {
+  AutomationInput,
+  UpsertReport,
+  deleteAutomation,
+  setAutomationEnabled,
+  upsertAutomations,
+} from '../lib/automations-api.js';
 import { Automation } from '../types/api.js';
 
 interface GlobalOpts {
@@ -112,24 +119,25 @@ export function registerAutomationsCommand(program: Command): void {
 
   cmd
     .command('create')
-    .description('Crear/agregar automatización desde archivo JSON')
+    .description('Crear/actualizar automatización(es) desde archivo JSON (item por item)')
     .requiredOption('-f, --file <path>', 'Archivo JSON con una Automation o un array')
     .action(async (opts: { file: string }) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
+      let items: AutomationInput[];
       try {
-        const raw = fs.readFileSync(opts.file, 'utf-8');
-        const parsed = JSON.parse(raw);
-        const toAdd: Automation[] = Array.isArray(parsed) ? parsed : [parsed];
-        const { data: current } = await client.get<Automation[]>('/config/automations');
-        const byId = new Map(current.map((a) => [a.id, a]));
-        for (const a of toAdd) byId.set(a.id, a);
-        await client.put('/config/automations', Array.from(byId.values()));
-        success(`Guardadas: ${toAdd.map((a) => a.id).join(', ')}`);
+        const parsed: unknown = JSON.parse(fs.readFileSync(opts.file, 'utf-8'));
+        items = (Array.isArray(parsed) ? parsed : [parsed]) as AutomationInput[];
       } catch (e) {
         fail((e as Error).message);
         process.exit(1);
       }
+      // Sin try/catch alrededor: `upsertAutomations` no propaga: corta en el
+      // primer error y lo devuelve dentro del reporte, junto con lo que ya
+      // quedó escrito y lo que ni se intentó. Ver `UpsertReport`.
+      const report = await upsertAutomations(client, items);
+      printUpsertReport(report);
+      if (report.failed) process.exit(1);
     });
 
   cmd
@@ -139,13 +147,9 @@ export function registerAutomationsCommand(program: Command): void {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
       try {
-        const { data } = await client.get<Automation[]>('/config/automations');
-        const next = data.filter((a) => a.id !== id);
-        if (next.length === data.length) {
-          fail(`No existe automatización ${id}`);
-          process.exit(1);
-        }
-        await client.put('/config/automations', next);
+        // El 404 de la API es el chequeo de existencia: preguntarlo antes con
+        // un GET sería una respuesta vieja para cuando llegue el DELETE.
+        await deleteAutomation(client, id);
         success(`Eliminada: ${id}`);
       } catch (e) {
         fail((e as Error).message);
@@ -154,20 +158,47 @@ export function registerAutomationsCommand(program: Command): void {
     });
 }
 
+/**
+ * El resultado de `create`, separando creadas de actualizadas — el «Guardadas:
+ * …» de antes no distinguía, y con un upsert la diferencia es justamente el
+ * dato: decía lo mismo al dar de alta algo nuevo que al pisar una automatización
+ * que ya existía.
+ *
+ * Si hubo un error, el reporte también dice dónde cortó y qué no se intentó:
+ * item por item no hay "todo o nada", así que dejar el corte implícito sería
+ * el fallo silencioso que este cambio viene a evitar.
+ */
+function printUpsertReport(report: UpsertReport): void {
+  const ids = (action: 'created' | 'updated'): string[] =>
+    report.applied.filter((o) => o.action === action).map((o) => o.id);
+  const created = ids('created');
+  const updated = ids('updated');
+  if (created.length) success(`Creadas (${created.length}): ${created.join(', ')}`);
+  if (updated.length) success(`Actualizadas (${updated.length}): ${updated.join(', ')}`);
+  if (!report.failed) {
+    if (!report.applied.length) info('El archivo no traía ninguna automatización.');
+    return;
+  }
+  fail(`Falló en ${report.failed.label}: ${report.failed.message}`);
+  if (report.notAttempted.length) {
+    warn(
+      `Sin intentar (${report.notAttempted.length}): ${report.notAttempted.join(', ')}`,
+    );
+  }
+  info(
+    'Se abortó en el primer error; lo listado como creado/actualizado YA quedó escrito. ' +
+      'Corregí el archivo y reintentá: volver a aplicarlo entero es seguro (create es idempotente).',
+  );
+}
+
 async function setEnabled(cmd: Command, id: string, enabled: boolean): Promise<void> {
   const g = getGlobals(cmd);
   const client = createApiClient({ apiUrl: g.apiUrl });
   const spinner = ora(`${enabled ? 'Habilitando' : 'Deshabilitando'} ${id}...`).start();
   try {
-    const { data } = await client.get<Automation[]>('/config/automations');
-    const target = data.find((a) => a.id === id);
-    if (!target) {
-      spinner.stop();
-      fail(`No existe automatización ${id}`);
-      process.exit(1);
-    }
-    target.enabled = enabled;
-    await client.put('/config/automations', data);
+    // Un booleano de UNA automatización: antes esto traía las 22 y devolvía
+    // las 22, con todo lo que hubiera cambiado en el medio pisado de vuelta.
+    await setAutomationEnabled(client, id, enabled);
     spinner.stop();
     success(`${id} ${enabled ? 'habilitada' : 'deshabilitada'}`);
   } catch (e) {

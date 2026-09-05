@@ -93,12 +93,16 @@ export interface Automation {
   // GET /config/automations. `trigger` y `actions` NO se van: siguen ahí para
   // el Dashboard y la App, y el CLI los sigue mostrando donde tienen sentido.
   //
-  // El CLI hace read-modify-write del array entero (create/delete/setEnabled):
-  // estos campos tienen que estar DECLARADOS para no perderse al reenviarlos.
+  // Estos campos tienen que estar DECLARADOS para no perderse al reenviarlos.
   // En runtime TypeScript no borra nada —el objeto viene del GET y se reenvía
   // tal cual—, pero el DTO del backend sí: con `whitelist: true` el
   // ValidationPipe descarta todo campo que no declare. Que el tipo de acá lo
   // refleje es lo que hace que el contrato se lea igual de los dos lados.
+  //
+  // CCE#107 — el CLI ya no hace read-modify-write del array entero, pero el
+  // punto sigue en pie: `create` reenvía la automatización COMPLETA por POST o
+  // PATCH (y el PATCH mergea top-level, así que lo que no se manda no se
+  // toca), y `cce config set-remote automations` manda el array entero.
 
   /** Los triggers, ya como lista. */
   when?: AutomationTrigger[];

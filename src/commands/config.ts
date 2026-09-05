@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import { createApiClient } from '../lib/api-client.js';
+import { replaceAllAutomations } from '../lib/automations-api.js';
 import { fail, info, printObject, success } from '../lib/format.js';
 import {
   getConfigPath,
@@ -83,7 +84,16 @@ export function registerConfigCommand(program: Command): void {
       try {
         const raw = await readStdin();
         const body = JSON.parse(raw);
-        await client.put(`/config/${section}`, body);
+        // CCE#107 — `automations` es la única sección con versionado optimista,
+        // y este comando es el ÚNICO replace masivo que le queda al CLI (las
+        // mutaciones puntuales viven en `cce automations`, item-level). Va con
+        // If-Match sí o sí: sin él, la API lo acepta pero pisa en silencio lo
+        // que la App o el Dashboard hayan escrito desde el último GET.
+        if (section === 'automations') {
+          await replaceAllAutomations(client, body);
+        } else {
+          await client.put(`/config/${section}`, body);
+        }
         success(`Config remota /${section} actualizada.`);
       } catch (e) {
         fail((e as Error).message);
