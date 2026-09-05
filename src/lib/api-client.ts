@@ -33,6 +33,42 @@ export function isApiError(e: unknown, status?: number): e is ApiError {
   return e instanceof ApiError && (status === undefined || e.status === status);
 }
 
+/**
+ * El mensaje ÚTIL de un error de la API.
+ *
+ * Nest arma el body como `{ statusCode, message, error }`, donde `message` es
+ * lo que el handler escribió y `error` es la frase genérica del status. El
+ * interceptor leía `error`, así que TODO error del CLI se imprimía como
+ * «HTTP 404: Not Found» o «HTTP 400: Bad Request» — con el mensaje real
+ * («No existe la automatización auto_1», o qué campo rechazó el
+ * ValidationPipe) descartado en el camino.
+ *
+ * Los cuatro cuerpos que manda esta API:
+ *  - `{ message: 'No existe la automatización auto_1', error: 'Not Found' }`
+ *  - `{ message: ['sourceAction must be one of…'], error: 'Bad Request' }` (ValidationPipe)
+ *  - `{ message: 'Flujo inválido en …', errors: ['flow[0].then[1].cond: …'] }` (acceptFlow)
+ *  - `{ message: 'Config de automations stale: …', currentVersion: 621 }` (409 del PUT)
+ */
+export function apiErrorMessage(status: number, data: unknown): string {
+  const body = (typeof data === 'object' && data !== null ? data : {}) as Record<string, unknown>;
+  const parts: string[] = [];
+
+  const message = body.message;
+  if (typeof message === 'string' && message.trim()) parts.push(message.trim());
+  else if (Array.isArray(message) && message.length) parts.push(message.map(String).join('; '));
+  else if (typeof body.error === 'string' && body.error.trim()) parts.push(body.error.trim());
+  else if (typeof data === 'string' && data.trim()) parts.push(data.trim());
+  else if (data !== undefined && data !== null) parts.push(JSON.stringify(data));
+  else parts.push(`sin cuerpo (HTTP ${status})`);
+
+  // `errors` es la lista de rutas del validador de flujos: sin ella un
+  // «Flujo inválido» no dice QUÉ step está mal, que es lo único accionable.
+  const errors = body.errors;
+  if (Array.isArray(errors) && errors.length) parts.push(`(${errors.map(String).join('; ')})`);
+
+  return parts.join(' ');
+}
+
 export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
   const baseURL = `${resolveApiUrl(opts.apiUrl).replace(/\/$/, '')}/api`;
   const apiToken = resolveApiToken();
@@ -49,8 +85,9 @@ export function createApiClient(opts: ClientOptions = {}): AxiosInstance {
     (err) => {
       if (err.response) {
         const { status, data } = err.response;
-        const msg = typeof data === 'object' && data?.error ? data.error : JSON.stringify(data);
-        return Promise.reject(new ApiError(`HTTP ${status}: ${msg}`, status, data));
+        return Promise.reject(
+          new ApiError(`HTTP ${status}: ${apiErrorMessage(status, data)}`, status, data),
+        );
       }
       if (err.code === 'ECONNREFUSED') {
         return Promise.reject(new Error(`Cannot reach CCE API at ${baseURL}. Is it running?`));

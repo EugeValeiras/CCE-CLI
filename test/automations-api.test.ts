@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ApiError } from '../src/lib/api-client.js';
+import { ApiError, apiErrorMessage } from '../src/lib/api-client.js';
 import {
   AutomationInput,
   AutomationsHttp,
   HttpResponse,
   deleteAutomation,
   replaceAllAutomations,
+  retryIsSafe,
   setAutomationEnabled,
   upsertAutomations,
 } from '../src/lib/automations-api.js';
@@ -19,6 +20,11 @@ import {
  * cliente hubiera escrito en el medio. Por eso cada caso mira la lista de
  * llamadas que salieron —y varios afirman lo que NO salió: ningún camino
  * item-level puede volver a mandar un PUT del array.
+ *
+ * Los errores de los fakes se arman con `apiErrorMessage`, el mismo que usa el
+ * interceptor real, sobre cuerpos calcados de la API. Una versión anterior de
+ * este suite inventaba mensajes que el CLI nunca producía y así validaba una
+ * calidad de diagnóstico inexistente; ver `api-client.test.ts`.
  */
 
 interface Call {
@@ -55,13 +61,38 @@ function fakeHttp(respond: Responder = () => OK): { client: AutomationsHttp; cal
   return { client, calls };
 }
 
+// ── errores como los arma el CLI de verdad ────────────────────────────────
+
+const nestError = (status: number, body: unknown): ApiError =>
+  new ApiError(`HTTP ${status}: ${apiErrorMessage(status, body)}`, status, body);
+
+const conflict = (id: string): ApiError =>
+  nestError(409, {
+    message: `Ya existe una automatización con id ${id}`,
+    error: 'Conflict',
+    statusCode: 409,
+  });
+
+const notFound = (id: string): ApiError =>
+  nestError(404, {
+    message: `No existe la automatización ${id}`,
+    error: 'Not Found',
+    statusCode: 404,
+  });
+
+const validationError = (...msgs: string[]): ApiError =>
+  nestError(400, { message: msgs, error: 'Bad Request', statusCode: 400 });
+
+const staleError = (sent: string, current: number): ApiError =>
+  nestError(409, {
+    message: `Config de automations stale: If-Match ${sent} != versión actual ${current}.`,
+    currentVersion: current,
+  });
+
 /** La respuesta real de POST /api/config/automations. */
 const created = (id: string): HttpResponse<unknown> => ({
   data: { success: true, automation: { id }, version: 621 },
 });
-
-const conflict = (id: string): ApiError =>
-  new ApiError(`HTTP 409: Ya existe una automatización con id ${id}`, 409);
 
 const auto = (id?: string): AutomationInput =>
   ({ ...(id ? { id } : {}), name: `auto ${id ?? 'sin id'}`, enabled: true }) as AutomationInput;
@@ -76,7 +107,9 @@ test('create: una automatización nueva sale por POST y nada más', async () => 
   assert.deepEqual(calls, [
     { method: 'POST', url: '/config/automations', body: auto('auto_nueva'), headers: undefined },
   ]);
-  assert.deepEqual(report.applied, [{ id: 'auto_nueva', action: 'created' }]);
+  assert.deepEqual(report.applied, [
+    { id: 'auto_nueva', label: 'auto_nueva', action: 'created', idGeneratedByServer: false },
+  ]);
   assert.equal(report.failed, undefined);
 });
 
@@ -88,7 +121,12 @@ test('create: sin id, el id que reporta es el que generó la API', async () => {
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, 'POST');
   assert.deepEqual(report.applied, [
-    { id: 'auto_generado_por_el_server', action: 'created' },
+    {
+      id: 'auto_generado_por_el_server',
+      label: '«auto sin id»',
+      action: 'created',
+      idGeneratedByServer: true,
+    },
   ]);
 });
 
@@ -107,7 +145,7 @@ test('create: un id que ya existe cae al PATCH del item y se reporta como actual
   // El id va en el path, no en el body: la API lo descartaría igual
   // (whitelist), y mandarlo sugeriría que se puede cambiar.
   assert.deepEqual(calls[1].body, { name: 'auto auto_vieja', enabled: true });
-  assert.deepEqual(report.applied, [{ id: 'auto_vieja', action: 'updated' }]);
+  assert.equal(report.applied[0].action, 'updated');
 });
 
 test('create: el id del path va escapado', async () => {
@@ -133,16 +171,54 @@ test('create: distingue creadas de actualizadas en la misma corrida', async () =
 
   const report = await upsertAutomations(client, [auto('auto_a'), auto('auto_b')]);
 
-  assert.deepEqual(report.applied, [
-    { id: 'auto_a', action: 'created' },
-    { id: 'auto_b', action: 'updated' },
-  ]);
+  assert.deepEqual(
+    report.applied.map((o) => `${o.id}:${o.action}`),
+    ['auto_a:created', 'auto_b:updated'],
+  );
+});
+
+test('create: el POST va PRIMERO — una alta nunca pasa por el DTO angosto del PATCH', async () => {
+  // No es un detalle de orden: `PatchAutomationDto` valida más angosto que el
+  // del POST (EugeValeiras/CCE#109), así que un PATCH-first haría fallar con
+  // 400 altas perfectamente válidas. sourceAction 'toggle' es una de ellas.
+  const conToggle = {
+    ...auto('auto_grupo'),
+    source: 'group',
+    sourceAction: 'toggle',
+  } as unknown as AutomationInput;
+  const { client, calls } = fakeHttp((call) => {
+    if (call.method === 'PATCH') throw validationError('sourceAction must be one of: on, off');
+    return created('auto_grupo');
+  });
+
+  const report = await upsertAutomations(client, [conToggle]);
+
+  assert.deepEqual(
+    calls.map((c) => c.method),
+    ['POST'],
+  );
+  assert.equal(report.failed, undefined);
+  assert.equal(report.applied[0].action, 'created');
+});
+
+test('create: un 400 del PATCH avisa que puede ser el DTO angosto de la API, no el archivo', async () => {
+  const { client } = fakeHttp((call) => {
+    if (call.method === 'POST') throw conflict('auto_grupo');
+    throw validationError('sourceAction must be one of the following values: on, off');
+  });
+
+  const report = await upsertAutomations(client, [auto('auto_grupo')]);
+
+  // El mensaje de la API, entero…
+  assert.match(report.failed?.message ?? '', /sourceAction must be one of/);
+  // …y la pista de que el body puede estar bien.
+  assert.match(report.failed?.message ?? '', /EugeValeiras\/CCE#109/);
 });
 
 test('create: un error que no es 409 corta ahí y NO se intenta el resto (fail-fast)', async () => {
   const { client, calls } = fakeHttp((call) => {
     const id = (call.body as { id: string }).id;
-    if (id === 'auto_b') throw new ApiError('HTTP 400: Flujo inválido en flow[0].then', 400);
+    if (id === 'auto_b') throw validationError('name should not be empty');
     return created(id);
   });
 
@@ -152,10 +228,13 @@ test('create: un error que no es 409 corta ahí y NO se intenta el resto (fail-f
     auto('auto_c'),
   ]);
 
-  assert.deepEqual(report.applied, [{ id: 'auto_a', action: 'created' }]);
+  assert.deepEqual(
+    report.applied.map((o) => o.id),
+    ['auto_a'],
+  );
   assert.deepEqual(report.failed, {
     label: 'auto_b',
-    message: 'HTTP 400: Flujo inválido en flow[0].then',
+    message: 'HTTP 400: name should not be empty',
   });
   assert.deepEqual(report.notAttempted, ['auto_c']);
   // auto_c no se tocó: dos POST (auto_a y el fallido auto_b) y se acabó.
@@ -175,6 +254,15 @@ test('create: sin id, un 409 no se traduce a PATCH — se reporta como error', a
   assert.equal(report.failed?.label, '«auto sin id»');
 });
 
+test('create: si el POST no devuelve el id, se corta en vez de reportar un id vacío', async () => {
+  const { client } = fakeHttp(() => ({ data: { success: true } }));
+
+  const report = await upsertAutomations(client, [auto()]);
+
+  assert.equal(report.applied.length, 0);
+  assert.match(report.failed?.message ?? '', /no devolvió el id/);
+});
+
 test('create: ningún camino manda el PUT masivo ni relee el array entero', async () => {
   const { client, calls } = fakeHttp((call) => {
     if (call.method === 'POST') throw conflict('auto_x');
@@ -185,6 +273,78 @@ test('create: ningún camino manda el PUT masivo ni relee el array entero', asyn
 
   assert.ok(!calls.some((c) => c.method === 'PUT'));
   assert.ok(!calls.some((c) => c.method === 'GET'));
+});
+
+// ── reintentar después de un abort ────────────────────────────────────────
+
+test('reintentar es seguro sólo si TODO lo aplicado tenía id', async () => {
+  const { client } = fakeHttp((call) => {
+    const id = (call.body as { id?: string }).id;
+    if (id === 'auto_malo') throw validationError('name should not be empty');
+    return created(id ?? 'auto_acuñado_por_el_server');
+  });
+
+  const conId = await upsertAutomations(client, [auto('auto_a'), auto('auto_malo')]);
+  assert.equal(retryIsSafe(conId), true);
+
+  // El mismo archivo pero con el primer item SIN id: reaplicarlo lo crearía de
+  // nuevo con OTRO id — dos automatizaciones idénticas sobre el mismo trigger.
+  const sinId = await upsertAutomations(client, [auto(), auto('auto_malo')]);
+  assert.equal(retryIsSafe(sinId), false);
+  assert.equal(sinId.applied[0].idGeneratedByServer, true);
+  assert.equal(sinId.applied[0].label, '«auto sin id»');
+  assert.equal(sinId.applied[0].id, 'auto_acuñado_por_el_server');
+});
+
+test('reintentar es seguro cuando no se aplicó nada', async () => {
+  const { client } = fakeHttp(() => {
+    throw validationError('name should not be empty');
+  });
+
+  const report = await upsertAutomations(client, [auto('auto_a')]);
+
+  assert.equal(report.applied.length, 0);
+  assert.equal(retryIsSafe(report), true);
+});
+
+// ── flowDerived: el no-op silencioso ──────────────────────────────────────
+
+test('create: avisa que la API descarta flow/when en los items flowDerived', async () => {
+  const exportada = {
+    ...auto('auto_1'),
+    flowDerived: true,
+    flow: [{ type: 'do', actions: [] }],
+    when: [{ type: 'manual' }],
+  } as unknown as AutomationInput;
+  const { client } = fakeHttp((call) => {
+    if (call.method === 'POST') throw conflict('auto_1');
+    return OK;
+  });
+
+  const report = await upsertAutomations(client, [exportada]);
+
+  // La escritura "funciona" (200) pero flow/when no se persisten: sin este
+  // aviso el CLI imprimía «✓ Actualizadas» sobre un cambio que no ocurrió.
+  assert.equal(report.applied[0].action, 'updated');
+  assert.equal(report.warnings.length, 1);
+  assert.match(report.warnings[0], /flowDerived/);
+  assert.match(report.warnings[0], /auto_1/);
+  assert.match(report.warnings[0], /quitá "flowDerived"/);
+});
+
+test('create: sin flowDerived (o sin flow) no hay aviso', async () => {
+  const { client } = fakeHttp(() => created('auto_1'));
+
+  const conFlow = await upsertAutomations(client, [
+    { ...auto('auto_1'), flow: [{ type: 'stop' }] } as unknown as AutomationInput,
+  ]);
+  assert.deepEqual(conFlow.warnings, []);
+
+  // flowDerived:true pero sin flow ni when: no hay nada que la API descarte.
+  const soloMarca = await upsertAutomations(client, [
+    { ...auto('auto_1'), flowDerived: true } as unknown as AutomationInput,
+  ]);
+  assert.deepEqual(soloMarca.warnings, []);
 });
 
 // ── delete ────────────────────────────────────────────────────────────────
@@ -199,9 +359,9 @@ test('delete: un DELETE al item, sin GET previo ni PUT del array', async () => {
   ]);
 });
 
-test('delete: un id inexistente propaga el 404 de la API', async () => {
+test('delete: un id inexistente propaga el 404 con el mensaje de la API', async () => {
   const { client } = fakeHttp(() => {
-    throw new ApiError('HTTP 404: No existe la automatización auto_fantasma', 404);
+    throw notFound('auto_fantasma');
   });
 
   await assert.rejects(
@@ -236,54 +396,88 @@ test('disable: mismo PATCH con {enabled:false}', async () => {
   assert.ok(!calls.some((c) => c.method === 'GET' || c.method === 'PUT'));
 });
 
-test('enable: un id inexistente propaga el 404 de la API', async () => {
+test('enable: un id inexistente propaga el 404 con el mensaje de la API', async () => {
   const { client } = fakeHttp(() => {
-    throw new ApiError('HTTP 404: No existe la automatización auto_fantasma', 404);
+    throw notFound('auto_fantasma');
   });
 
   await assert.rejects(
     () => setAutomationEnabled(client, 'auto_fantasma', true),
-    /HTTP 404/,
+    /HTTP 404: No existe la automatización auto_fantasma/,
   );
 });
 
 // ── replace masivo (config set-remote automations) ────────────────────────
 
-test('replace masivo: manda If-Match con la versión del GET', async () => {
-  const { client, calls } = fakeHttp((call) =>
-    call.method === 'GET' ? { data: [], headers: { 'x-config-version': '620' } } : OK,
-  );
+test('replace masivo: manda el If-Match que le dieron y NO lee la versión por su cuenta', async () => {
+  const { client, calls } = fakeHttp();
 
-  await replaceAllAutomations(client, [auto('auto_1')]);
+  await replaceAllAutomations(client, [auto('auto_1')], '620');
 
+  // El GET propio es justamente lo que NO puede haber: la versión tiene que
+  // venir de la lectura que el usuario editó, no de una de recién.
   assert.deepEqual(
     calls.map((c) => `${c.method} ${c.url}`),
-    ['GET /config/automations', 'PUT /config/automations'],
+    ['PUT /config/automations'],
   );
-  assert.deepEqual(calls[1].headers, { 'If-Match': '620' });
+  assert.deepEqual(calls[0].headers, { 'If-Match': '620' });
 });
 
-test('replace masivo: sin X-Config-Version no se envía el PUT', async () => {
-  const { client, calls } = fakeHttp(() => ({ data: [], headers: {} }));
+test('replace masivo: sin versión no se envía nada, y dice cómo conseguirla', async () => {
+  const { client, calls } = fakeHttp();
 
   await assert.rejects(
-    () => replaceAllAutomations(client, []),
-    /X-Config-Version/,
+    () => replaceAllAutomations(client, [], ''),
+    (e: Error) => {
+      assert.match(e.message, /Falta --if-match/);
+      assert.match(e.message, /cce config show automations/);
+      return true;
+    },
   );
-  assert.ok(!calls.some((c) => c.method === 'PUT'));
+  assert.equal(calls.length, 0);
 });
 
-test('replace masivo: el 409 se traduce a un mensaje accionable', async () => {
-  const { client } = fakeHttp((call) => {
-    if (call.method === 'GET') return { data: [], headers: { 'x-config-version': '620' } };
-    throw new ApiError('HTTP 409: Config de automations stale', 409);
+test('replace masivo: el 409 dice qué versión editabas y cuál corre ahora', async () => {
+  const { client } = fakeHttp(() => {
+    throw staleError('620', 621);
   });
 
-  await assert.rejects(() => replaceAllAutomations(client, []), (e: Error) => {
-    assert.match(e.message, /cambió mientras editabas \(tu versión: 620\)/);
-    assert.match(e.message, /No se escribió nada/);
-    return true;
+  await assert.rejects(
+    () => replaceAllAutomations(client, [], '620'),
+    (e: Error) => {
+      assert.match(e.message, /cambió desde la versión 620 que editabas/);
+      assert.match(e.message, /ahora va por la 621/);
+      assert.match(e.message, /No se escribió nada/);
+      return true;
+    },
+  );
+});
+
+test('replace masivo: el escenario del incidente — editar 10 minutos y reescribir encima', async () => {
+  // El dueño exportó en la versión 620; la App creó una automatización
+  // (→ 621) mientras él editaba. Su archivo NO la tiene.
+  const array = [auto('auto_1')];
+  let serverVersion = 620;
+  const { client } = fakeHttp((call) => {
+    const sent = call.headers?.['If-Match'];
+    if (Number(sent) !== serverVersion) throw staleError(String(sent), serverVersion);
+    array.length = 0;
+    array.push(...(call.body as AutomationInput[]));
+    serverVersion++;
+    return OK;
   });
+  array.push(auto('auto_de_la_app'));
+  serverVersion = 621;
+
+  // Reescribe con la versión en la que SE BASÓ la edición: la API lo frena.
+  await assert.rejects(
+    () => replaceAllAutomations(client, [auto('auto_1')], '620'),
+    /cambió desde la versión 620/,
+  );
+  assert.ok(
+    array.some((a) => a.id === 'auto_de_la_app'),
+    'el replace masivo borró la automatización que había creado la App',
+  );
 });
 
 // ── el criterio que da sentido al issue ───────────────────────────────────
@@ -317,14 +511,14 @@ function statefulApi(
     if (call.method === 'PATCH') {
       const id = decodeURIComponent(call.url.split('/').pop() as string);
       const i = state.findIndex((a) => a.id === id);
-      if (i === -1) throw new ApiError(`HTTP 404: No existe la automatización ${id}`, 404);
+      if (i === -1) throw notFound(id);
       state[i] = { ...state[i], ...(call.body as AutomationInput) };
       return OK;
     }
     if (call.method === 'DELETE') {
       const id = decodeURIComponent(call.url.split('/').pop() as string);
       const i = state.findIndex((a) => a.id === id);
-      if (i === -1) throw new ApiError(`HTTP 404: No existe la automatización ${id}`, 404);
+      if (i === -1) throw notFound(id);
       state.splice(i, 1);
       return OK;
     }
@@ -358,12 +552,10 @@ test('create: una automatización creada por otra vía EN EL MEDIO sigue existie
   const report = await upsertAutomations(client, [auto('auto_del_cli_1'), auto('auto_del_cli_2')]);
 
   assert.equal(report.failed, undefined);
-  assert.deepEqual(state.map((a) => a.id), [
-    'auto_ya_estaba',
-    'auto_del_cli_1',
-    'auto_de_la_app',
-    'auto_del_cli_2',
-  ]);
+  assert.deepEqual(
+    state.map((a) => a.id),
+    ['auto_ya_estaba', 'auto_del_cli_1', 'auto_de_la_app', 'auto_del_cli_2'],
+  );
 });
 
 test('enable: cambiar un booleano no puede pisar una escritura ajena ni a las vecinas', async () => {
@@ -375,7 +567,10 @@ test('enable: cambiar un booleano no puede pisar una escritura ajena ni a las ve
 
   assert.equal(state.find((a) => a.id === 'auto_1')?.enabled, false);
   assert.equal(state.find((a) => a.id === 'auto_2')?.enabled, true);
-  assert.ok(state.some((a) => a.id === 'auto_de_la_app'), 'se perdió la escritura ajena');
+  assert.ok(
+    state.some((a) => a.id === 'auto_de_la_app'),
+    'se perdió la escritura ajena',
+  );
 });
 
 test('delete: borrar una no puede pisar una escritura ajena', async () => {
@@ -385,5 +580,8 @@ test('delete: borrar una no puede pisar una escritura ajena', async () => {
 
   await deleteAutomation(client, 'auto_1');
 
-  assert.deepEqual(state.map((a) => a.id), ['auto_2', 'auto_de_la_app']);
+  assert.deepEqual(
+    state.map((a) => a.id),
+    ['auto_2', 'auto_de_la_app'],
+  );
 });

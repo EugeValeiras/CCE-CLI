@@ -63,6 +63,16 @@ export function warn(msg: string): void {
   console.warn(chalk.yellow('!'), msg);
 }
 
+/**
+ * Como `info`, pero por STDERR: para anotar algo al margen de una salida que el
+ * usuario está redirigiendo. `cce config show automations > f.json` tiene que
+ * seguir escribiendo JSON válido en el archivo, y la versión de la config es
+ * justamente el dato que hace falta anotar ahí al lado.
+ */
+export function note(msg: string): void {
+  console.error(chalk.blue('ℹ'), msg);
+}
+
 export function fail(msg: string): void {
   console.error(chalk.red('✗'), msg);
 }

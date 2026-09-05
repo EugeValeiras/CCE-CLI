@@ -104,17 +104,35 @@ el Dashboard hayan escrito en el medio.
 
 - `create -f` es un **upsert**: por cada automatización del archivo manda un
   `POST` y, si la API responde 409 porque el id ya existe, un `PATCH`. La salida
-  distingue creadas de actualizadas.
+  distingue creadas de actualizadas. Son hasta 2 llamadas por item (y un commit
+  server-side por cada una), así que un archivo de 20 no es una operación
+  barata ni instantánea para el resto de los clientes.
 - El `PATCH` mergea **top-level**: un campo que el archivo no trae se
   **conserva** (antes, con el replace masivo, se borraba). Para vaciar una
   sección hay que mandarla explícitamente; y para cambiar algo anidado
   (`trigger.sensorTriggers[].sensorBindingId`) va el objeto `trigger` completo.
 - Con varias automatizaciones en el archivo el corte es **fail-fast**: al primer
   error se aborta y se informa qué quedó aplicado, dónde cortó y qué no se
-  intentó (exit ≠ 0). Reaplicar el archivo entero después de corregirlo es
-  seguro: el upsert es idempotente.
+  intentó (exit ≠ 0).
+- **Reaplicar el archivo corregido** es seguro para los items **con id** (el
+  segundo intento los actualiza). Un item **sin id** NO es re-aplicable: cada
+  `POST` acuña un id nuevo, así que volver a mandarlo crea un duplicado sobre el
+  mismo trigger. Cuando eso pasa, el reporte lista los ids que acuñó la API y
+  avisa de no reaplicar el archivo tal cual.
 - `delete`/`enable`/`disable` sobre un id inexistente fallan con el 404 de la
   API y exit ≠ 0.
+
+**Ojo con el flujo al re-aplicar un export.** `show --format json` estampa
+`"flowDerived": true` en toda automatización cuyo `flow` es la proyección del
+formato viejo — en esta casa, todas. La API **descarta `flow` y `when`** en los
+items que traen esa marca (para no persistir un flujo derivado que quedaría
+stale respecto de `actions`), así que exportar → editar el flujo → re-aplicar
+**no guarda la edición**. El CLI lo avisa; para que se persista hay que quitar
+`"flowDerived"` de ese item del archivo.
+
+**Editar una automatización con `sourceAction: "toggle"`** falla hoy con 400: el
+DTO del `PATCH` de la API valida más angosto que el del `POST`/`PUT`
+(EugeValeiras/CCE#109). No es el archivo. El CLI lo señala en el mensaje.
 
 ### `config`
 
@@ -128,10 +146,24 @@ cce config set <keyPath> <value>   # dot notation
 cce config unset <keyPath>
 ```
 
-> `config set-remote automations` es el único replace masivo que queda en el
-> CLI, y va con `If-Match` de la versión del `GET` previo: si alguien escribió
-> en el medio, la API responde 409, no se escribe nada y el CLI lo explica.
-> Para mutaciones puntuales usá `cce automations` (item-level).
+`config set-remote automations` es el único replace masivo que queda en el CLI
+(pisa el array entero) y **exige `--if-match <version>`**:
+
+```bash
+cce config show automations > autos.json   # imprime la versión por stderr
+# … editás autos.json …
+cat autos.json | cce config set-remote automations --if-match 620
+```
+
+La versión tiene que ser la de la lectura **en la que se basó la edición**, no
+una de recién: si la App creó algo mientras editabas, la API responde 409, no se
+escribe nada, y el CLI dice con qué versión reintentar. Un `If-Match` tomado de
+un `GET` hecho al momento de escribir coincidiría siempre y no protegería de
+nada — que es exactamente el incidente que este chequeo existe para evitar.
+`--if-match '*'` escribe sin chequeo, a tu riesgo.
+
+> Para mutaciones puntuales usá `cce automations` (item-level): no necesitan
+> versión porque no pueden pisar al resto del array.
 
 ### `events live`
 

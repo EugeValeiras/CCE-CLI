@@ -9,6 +9,7 @@ import {
   AutomationInput,
   UpsertReport,
   deleteAutomation,
+  retryIsSafe,
   setAutomationEnabled,
   upsertAutomations,
 } from '../lib/automations-api.js';
@@ -130,14 +131,18 @@ export function registerAutomationsCommand(program: Command): void {
         items = (Array.isArray(parsed) ? parsed : [parsed]) as AutomationInput[];
       } catch (e) {
         fail((e as Error).message);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
       // Sin try/catch alrededor: `upsertAutomations` no propaga: corta en el
       // primer error y lo devuelve dentro del reporte, junto con lo que ya
       // quedó escrito y lo que ni se intentó. Ver `UpsertReport`.
       const report = await upsertAutomations(client, items);
       printUpsertReport(report);
-      if (report.failed) process.exit(1);
+      // `process.exitCode` y no `process.exit(1)`: con stdout hacia un pipe
+      // (`| tee`, CI) el exit inmediato trunca las escrituras pendientes, y lo
+      // que se pierde es justo el reporte de qué quedó aplicado tras un abort.
+      if (report.failed) process.exitCode = 1;
     });
 
   cmd
@@ -153,7 +158,7 @@ export function registerAutomationsCommand(program: Command): void {
         success(`Eliminada: ${id}`);
       } catch (e) {
         fail((e as Error).message);
-        process.exit(1);
+        process.exitCode = 1;
       }
     });
 }
@@ -164,17 +169,33 @@ export function registerAutomationsCommand(program: Command): void {
  * dato: decía lo mismo al dar de alta algo nuevo que al pisar una automatización
  * que ya existía.
  *
- * Si hubo un error, el reporte también dice dónde cortó y qué no se intentó:
- * item por item no hay "todo o nada", así que dejar el corte implícito sería
- * el fallo silencioso que este cambio viene a evitar.
+ * Si hubo un error, el reporte también dice dónde cortó, qué no se intentó y si
+ * reaplicar el archivo es seguro: item por item no hay "todo o nada", así que
+ * dejar el corte implícito sería el fallo silencioso que este cambio viene a
+ * evitar. Se exporta para poder testear el reporte, que es la mitad del
+ * contrato del fail-fast.
  */
-function printUpsertReport(report: UpsertReport): void {
+export function printUpsertReport(report: UpsertReport): void {
   const ids = (action: 'created' | 'updated'): string[] =>
     report.applied.filter((o) => o.action === action).map((o) => o.id);
   const created = ids('created');
   const updated = ids('updated');
   if (created.length) success(`Creadas (${created.length}): ${created.join(', ')}`);
   if (updated.length) success(`Actualizadas (${updated.length}): ${updated.join(', ')}`);
+
+  // Los items que el archivo mandó SIN id: el que los escribió no tiene cómo
+  // saber qué id les tocó, y son los únicos que reaplicar duplicaría.
+  const generated = report.applied.filter((o) => o.idGeneratedByServer);
+  if (generated.length) {
+    warn(
+      `Con id generado por la API (${generated.length}) — el archivo no los trae, así que ` +
+        'reaplicarlo tal cual las DUPLICA:',
+    );
+    for (const o of generated) console.error(`    ${o.label} → ${o.id}`);
+  }
+
+  for (const w of report.warnings) warn(w);
+
   if (!report.failed) {
     if (!report.applied.length) info('El archivo no traía ninguna automatización.');
     return;
@@ -185,9 +206,26 @@ function printUpsertReport(report: UpsertReport): void {
       `Sin intentar (${report.notAttempted.length}): ${report.notAttempted.join(', ')}`,
     );
   }
-  info(
-    'Se abortó en el primer error; lo listado como creado/actualizado YA quedó escrito. ' +
-      'Corregí el archivo y reintentá: volver a aplicarlo entero es seguro (create es idempotente).',
+  info(retryAdvice(report));
+}
+
+/** Qué hacer después de un abort, que depende de si reaplicar duplica o no. */
+function retryAdvice(report: UpsertReport): string {
+  if (!report.applied.length) {
+    return 'Se abortó en el primer item: no quedó nada escrito. Corregí el archivo y reintentá.';
+  }
+  if (retryIsSafe(report)) {
+    return (
+      'Se abortó en el primer error; lo listado arriba YA quedó escrito. Corregí el ' +
+      'archivo y reintentá: todos los items aplicados tienen id, así que volver a ' +
+      'aplicarlo entero los ACTUALIZA en vez de duplicarlos.'
+    );
+  }
+  return (
+    'Se abortó en el primer error; lo listado arriba YA quedó escrito. NO reapliques el ' +
+    'archivo tal cual: los items sin id que ya entraron se crearían de nuevo con OTRO id ' +
+    '(dos automatizaciones idénticas sobre el mismo trigger). Sacálos del archivo, o ' +
+    'poneles el id que les tocó (arriba), antes de reintentar.'
   );
 }
 
@@ -204,6 +242,6 @@ async function setEnabled(cmd: Command, id: string, enabled: boolean): Promise<v
   } catch (e) {
     spinner.stop();
     fail((e as Error).message);
-    process.exit(1);
+    process.exitCode = 1;
   }
 }

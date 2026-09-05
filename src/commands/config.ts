@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { createApiClient } from '../lib/api-client.js';
-import { replaceAllAutomations } from '../lib/automations-api.js';
-import { fail, info, printObject, success } from '../lib/format.js';
+import { readConfigVersion, replaceAllAutomations } from '../lib/automations-api.js';
+import { fail, info, note, printObject, success, warn } from '../lib/format.js';
 import {
   getConfigPath,
   loadConfig,
@@ -67,18 +67,33 @@ export function registerConfigCommand(program: Command): void {
       const client = createApiClient({ apiUrl: g.apiUrl });
       try {
         const url = section ? `/config/${section}` : '/config';
-        const { data } = await client.get(url);
+        const { data, headers } = await client.get(url);
         printObject(data, fmt === 'table' ? 'json' : fmt);
+        // CCE#107 — la versión de ESTA lectura, que es la que hay que mandar
+        // como If-Match si lo que sigue es editar y reescribir el array. Va por
+        // stderr para no romper `cce config show automations > f.json`.
+        const version = section ? readConfigVersion(headers as Record<string, unknown>) : undefined;
+        if (version) {
+          note(
+            `Versión de esta lectura: ${version}. Si vas a reescribir el array entero: ` +
+              `cce config set-remote ${section} --if-match ${version}`,
+          );
+        }
       } catch (e) {
         fail((e as Error).message);
-        process.exit(1);
+        process.exitCode = 1;
       }
     });
 
   cmd
     .command('set-remote <section>')
     .description('Setear sección de la config remota desde stdin JSON')
-    .action(async (section: string) => {
+    .option(
+      '--if-match <version>',
+      'Versión de la lectura que editaste (la imprime `config show`). Obligatorio para ' +
+        '`automations`. `*` escribe sin chequeo, a tu riesgo.',
+    )
+    .action(async (section: string, opts: { ifMatch?: string }) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
       try {
@@ -86,18 +101,22 @@ export function registerConfigCommand(program: Command): void {
         const body = JSON.parse(raw);
         // CCE#107 — `automations` es la única sección con versionado optimista,
         // y este comando es el ÚNICO replace masivo que le queda al CLI (las
-        // mutaciones puntuales viven en `cce automations`, item-level). Va con
-        // If-Match sí o sí: sin él, la API lo acepta pero pisa en silencio lo
-        // que la App o el Dashboard hayan escrito desde el último GET.
+        // mutaciones puntuales viven en `cce automations`, item-level). La
+        // versión la trae el usuario desde el `config show` que editó: un
+        // If-Match tomado de un GET de recién coincide siempre y no protege de
+        // nada. Ver `replaceAllAutomations`.
         if (section === 'automations') {
-          await replaceAllAutomations(client, body);
+          await replaceAllAutomations(client, body, opts.ifMatch ?? '');
         } else {
+          if (opts.ifMatch) {
+            warn(`--if-match se ignora en /${section}: sólo automations tiene versionado.`);
+          }
           await client.put(`/config/${section}`, body);
         }
         success(`Config remota /${section} actualizada.`);
       } catch (e) {
         fail((e as Error).message);
-        process.exit(1);
+        process.exitCode = 1;
       }
     });
 
