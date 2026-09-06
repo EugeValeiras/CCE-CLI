@@ -193,6 +193,38 @@ misma ruta y también exigen `--if-match`.
 > Para mutaciones puntuales usá `cce automations` (item-level): no necesitan
 > versión porque no pueden pisar al resto del array.
 
+### `alarm`
+
+```bash
+cce alarm status             # GET /api/config/alarm-armed
+cce alarm arm
+cce alarm disarm
+cce alarm test-mode          # sólo muestra el estado
+cce alarm test-mode on       # PUT /api/config/alarm-test-mode { enabled: true }
+cce alarm test-mode off
+```
+
+**Modo prueba** (CCE#122): con la alarma armada, el disparo por sensor sigue
+ocurriendo pero llega **sólo como push** — sin sirena, sin overlay, sin
+repetición y sin atravesar el modo silencio del iPhone. Es para acostumbrarse a
+la alarma sin que cada prueba tome la pantalla del panel.
+
+Es un toggle **manual**: no vence solo. Por eso `status` y `arm` avisan por
+stderr cuando está activo — una alarma muda que dice "armada" a secas es una
+trampa. El aviso va por stderr a propósito: `cce alarm status --format json |
+jq` sigue recibiendo JSON válido.
+
+Con la alarma **desarmada** el aviso baja el tono: gritar "no va a sonar" sobre
+una alarma que no iba a sonar igual convierte en rutina un mensaje cuyo valor
+entero es ser raro.
+
+`test-mode on|off` reporta lo que confirmó el **backend**, no lo que se pidió:
+una respuesta sin `enabled` sale con error en vez de prometer un cambio que
+quizá no se guardó.
+
+`test-mode` sólo acepta `on` u `off`: cualquier otra cosa se corta en el CLI sin
+mandar nada, porque adivinar acá es silenciar la alarma de una casa por un typo.
+
 ### `events live`
 
 ```bash
