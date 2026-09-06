@@ -27,6 +27,12 @@ interface Call {
 class FakeAlarmApi {
   armed = false;
   testMode = false;
+  /** El backend contesta 200 con OTRO valor del que se pidió. */
+  forceEnabledResponse: boolean | null = null;
+  /** El backend contesta 200 sin el campo `enabled`. */
+  omitEnabledResponse = false;
+  /** El PUT del modo prueba revienta. */
+  failTestModePut = false;
   readonly calls: Call[] = [];
 
   listen(): Promise<{ url: string; close: () => Promise<void> }> {
@@ -55,12 +61,16 @@ class FakeAlarmApi {
           return reply(200, { enabled: this.testMode });
         }
         if (path === '/api/config/alarm-test-mode' && method === 'PUT') {
+          if (this.failTestModePut) {
+            return reply(500, { message: 'boom', statusCode: 500 });
+          }
           // Igual que el DTO de la API: `enabled` booleano o 400.
           const enabled = (body as { enabled?: unknown } | undefined)?.enabled;
           if (typeof enabled !== 'boolean') {
             return reply(400, { message: 'enabled must be a boolean value', statusCode: 400 });
           }
-          this.testMode = enabled;
+          this.testMode = this.forceEnabledResponse ?? enabled;
+          if (this.omitEnabledResponse) return reply(200, { success: true });
           return reply(200, { success: true, enabled: this.testMode });
         }
         reply(404, { message: 'Not found', statusCode: 404 });
@@ -110,6 +120,8 @@ const puts = () => api.calls.filter((c) => c.method === 'PUT');
 // ── test-mode: prender y apagar ───────────────────────────────────────────
 
 test('test-mode on manda `enabled: true` y avisa que la alarma no va a sonar', async () => {
+  api.armed = true;
+
   const { out, exitCode } = await run('alarm', 'test-mode', 'on');
 
   assert.equal(exitCode, 0);
@@ -123,6 +135,7 @@ test('test-mode on manda `enabled: true` y avisa que la alarma no va a sonar', a
 });
 
 test('test-mode off apaga y dice que la alarma vuelve a sonar', async () => {
+  api.armed = true;
   api.testMode = true;
 
   const { out, exitCode } = await run('alarm', 'test-mode', 'off');
@@ -137,6 +150,7 @@ test('test-mode off apaga y dice que la alarma vuelve a sonar', async () => {
 });
 
 test('test-mode sin argumento sólo lee: no escribe nada', async () => {
+  api.armed = true;
   api.testMode = true;
 
   const { out, exitCode } = await run('alarm', 'test-mode');
@@ -152,6 +166,70 @@ test('test-mode apagado: el estado se imprime y no hay aviso que asuste', async 
 
   assert.match(out, /"enabled": false/);
   assert.doesNotMatch(out, /MODO PRUEBA ACTIVO/);
+});
+
+// ── el backend manda, no lo que se pidió ──────────────────────────────────
+
+test('el estado que queda es el que confirmó el backend, no el que se pidió', async () => {
+  // El backend acepta el PUT pero deja el modo APAGADO (un config que no
+  // guardó, un middleware, lo que sea): el CLI no puede decir "activado".
+  api.forceEnabledResponse = false;
+
+  const { out, exitCode } = await run('alarm', 'test-mode', 'on');
+
+  assert.equal(exitCode, 0);
+  assert.doesNotMatch(out, /MODO PRUEBA ACTIVO/);
+  assert.match(out, /desactivado/i);
+});
+
+test('una respuesta sin `enabled` no confirma nada: sale con error', async () => {
+  api.omitEnabledResponse = true;
+
+  const { out, exitCode } = await run('alarm', 'test-mode', 'on');
+
+  assert.equal(exitCode, 1);
+  assert.match(out, /no confirmó/i);
+  assert.doesNotMatch(out, /Modo prueba ACTIVADO/);
+});
+
+test('si el PUT falla, sale con exitCode y no con process.exit', async () => {
+  api.failTestModePut = true;
+
+  const { out, exitCode } = await run('alarm', 'test-mode', 'on');
+
+  assert.equal(exitCode, 1);
+  assert.match(out, /HTTP 500/);
+});
+
+// ── con la alarma DESARMADA el aviso no grita ─────────────────────────────
+
+test('desarmada, el aviso del modo prueba baja el tono', async () => {
+  api.testMode = true;
+
+  const { out } = await run('alarm', 'test-mode');
+
+  assert.match(out, /Modo prueba activo/);
+  assert.match(out, /desarmada/i);
+  assert.doesNotMatch(out, /NO va a sonar/,
+    'gritar sobre una alarma que no iba a sonar igual convierte el aviso en rutina');
+});
+
+test('desarmada, apagar el modo prueba no promete que "vuelve a sonar"', async () => {
+  api.testMode = true;
+
+  const { out } = await run('alarm', 'test-mode', 'off');
+
+  assert.match(out, /Modo prueba desactivado/);
+  assert.doesNotMatch(out, /vuelve a sonar/);
+});
+
+test('desarmada, status tampoco grita', async () => {
+  api.testMode = true;
+
+  const { out } = await run('alarm', 'status');
+
+  assert.match(out, /Modo prueba activo/);
+  assert.doesNotMatch(out, /NO va a sonar/);
 });
 
 test('un estado que no se entiende NO se manda: `on`/`off` y nada más', async () => {

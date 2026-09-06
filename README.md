@@ -214,6 +214,14 @@ stderr cuando está activo — una alarma muda que dice "armada" a secas es una
 trampa. El aviso va por stderr a propósito: `cce alarm status --format json |
 jq` sigue recibiendo JSON válido.
 
+Con la alarma **desarmada** el aviso baja el tono: gritar "no va a sonar" sobre
+una alarma que no iba a sonar igual convierte en rutina un mensaje cuyo valor
+entero es ser raro.
+
+`test-mode on|off` reporta lo que confirmó el **backend**, no lo que se pidió:
+una respuesta sin `enabled` sale con error en vez de prometer un cambio que
+quizá no se guardó.
+
 `test-mode` sólo acepta `on` u `off`: cualquier otra cosa se corta en el CLI sin
 mandar nada, porque adivinar acá es silenciar la alarma de una casa por un typo.
 
