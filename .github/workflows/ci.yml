@@ -6,6 +6,27 @@ on:
   push:
   pull_request:
 
+# Un commit, un run (CCE#125): una rama con PR abierto dispara push Y
+# pull_request, y eso corría el CI dos veces sobre el mismo commit — cuatro
+# jobs sobre la Pi de 4GB cuando hay tareas en dos repos, esperándose entre sí
+# en el flock (CI de 15 y 20 min el 06/09, y un build del Dashboard muerto por
+# el OOM killer). Con el mismo group cae uno, y el que sobrevive es el de
+# pull_request: el único que prueba el head MERGEADO con main, en vez de la
+# rama contra su base, que en esta casa suele estar vieja.
+#
+# El group rearma refs/heads/<rama> desde head_ref porque en pull_request
+# github.ref vale refs/pull/<n>/merge. Con github.ref crudo los dos eventos dan
+# cadenas distintas y no se agrupa nada: probado en CCE-CLI, los dos runs
+# corrieron enteros. Y evita colapsar la rama v1.2.3 con el tag homónimo, cosa
+# que sí hace ref_name. github.workflow va porque el alcance de un grupo de
+# concurrency es el repositorio, no el workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
+  # En main no se cancela: este repo no tiene deploy.yml, así que el run de main
+  # es su única verificación y dos merges seguidos dejarían al primero sin
+  # verificar nunca.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     name: Build
