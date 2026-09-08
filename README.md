@@ -197,12 +197,36 @@ misma ruta y también exigen `--if-match`.
 
 ```bash
 cce alarm status             # GET /api/config/alarm-armed
-cce alarm arm
+cce alarm arm                # arma el TIPO que esté elegido
+cce alarm arm perimetral     # PUT /api/config/alarm-armed { armed: true, mode: 'perimeter' }
+cce alarm arm total
 cce alarm disarm
+cce alarm mode               # sólo muestra el tipo elegido
+cce alarm mode perimetral    # PUT /api/config/alarm-mode — NO arma ni desarma
 cce alarm test-mode          # sólo muestra el estado
 cce alarm test-mode on       # PUT /api/config/alarm-test-mode { enabled: true }
 cce alarm test-mode off
 ```
+
+**Tipo de alarma** (CCE#133): la alarma se arma de dos formas —**perimetral**
+(puertas y accesos: se puede estar adentro) y **total** (todo, incluido el
+movimiento interior)—, y cada sensor dice en cuál participa. El perímetro es un
+subconjunto del total.
+
+`cce alarm arm` **sin argumento arma el tipo que esté elegido**, que es lo mismo
+que hacen Siri, las escenas y la acción `alarmAction: 'arm'` de una
+automatización. Eso es lo que hace que el comando siga significando exactamente
+lo que significaba: con tipo se manda `mode`, sin tipo el body es el de siempre.
+
+`cce alarm mode <tipo>` cambia el tipo **sin armar ni desarmar**. Con la alarma
+armada eso cambia qué protege la casa AHORA, y el CLI lo dice; desarmada,
+avisa que es lo que se va a armar la próxima vez.
+
+Igual que `test-mode`, sólo acepta los tipos que entiende: un `perimetal` se
+corta en el CLI sin mandar nada, porque adivinar acá es armar la casa
+protegiendo otra cosa de la que se pidió. Y un backend que no manda `mode`
+—uno anterior a CCE#133— no se completa con un default: `status` no lo nombra y
+`mode` avisa que la API no conoce los tipos, en vez de inventar uno.
 
 **Modo prueba** (CCE#122): con la alarma armada, el disparo por sensor sigue
 ocurriendo pero llega **sólo como push** — sin sirena, sin overlay, sin
@@ -224,6 +248,10 @@ quizá no se guardó.
 
 `test-mode` sólo acepta `on` u `off`: cualquier otra cosa se corta en el CLI sin
 mandar nada, porque adivinar acá es silenciar la alarma de una casa por un typo.
+
+> **Ojo con los dos «modos».** El *tipo* de alarma (perimetral / total) dice QUÉ
+> protege; el *modo prueba* dice si el aviso suena. Son independientes: se puede
+> estar armado en total y mudo. `status` los declara los dos.
 
 ### `events live`
 
