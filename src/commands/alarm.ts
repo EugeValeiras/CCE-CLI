@@ -27,6 +27,7 @@ export function registerAlarmCommand(program: Command): void {
       try {
         const { data } = await client.get('/config/alarm-armed');
         printObject(data, fmt === 'table' ? 'json' : fmt);
+        avisarTipo(data);
         avisarModoPrueba(data);
       } catch (e) {
         fail((e as Error).message);
@@ -36,21 +37,56 @@ export function registerAlarmCommand(program: Command): void {
 
   cmd
     .command('arm')
+    .argument(
+      '[tipo]',
+      "'perimetral' o 'total'; sin argumento arma el tipo que esté elegido",
+    )
     .description('Armar la alarma (PUT /config/alarm-armed { armed: true })')
-    .action(async () => {
+    .action(async (tipo?: string) => {
       const g = getGlobals(cmd);
       const client = createApiClient({ apiUrl: g.apiUrl });
-      const spinner = ora('Armando alarma...').start();
+
+      // Un tipo que no se entiende NO se manda. Adivinar acá es armar la
+      // alarma de una casa real protegiendo otra cosa de la que se pidió —
+      // exactamente el mismo criterio que `test-mode` con `on`/`off`.
+      let modo: AlarmMode | undefined;
+      if (tipo !== undefined) {
+        modo = parseTipo(tipo);
+        if (!modo) {
+          fail(
+            `Tipo desconocido: "${tipo}". Usá 'perimetral' o 'total' ` +
+              '(o nada para armar el tipo elegido).',
+          );
+          process.exitCode = 1;
+          return;
+        }
+      }
+
+      const spinner = ora(
+        modo ? `Armando alarma ${etiquetaTipo(modo)}...` : 'Armando alarma...',
+      ).start();
       try {
-        await client.put('/config/alarm-armed', { armed: true });
+        // SIN `mode` cuando no se pidió uno: el backend arma el tipo que esté
+        // elegido. Es lo que hace que `cce alarm arm` siga significando lo
+        // mismo que antes de CCE#133, igual que Siri y las escenas.
+        const { data } = await client.put('/config/alarm-armed', {
+          armed: true,
+          ...(modo ? { mode: modo } : {}),
+        });
         spinner.stop();
-        success('Alarma armada');
+        // Lo que se dice es lo que confirmó el BACKEND, no lo que se pidió:
+        // sin `mode` en la respuesta (una API vieja) se dice «Alarma armada»
+        // a secas en vez de inventar un tipo.
+        const confirmado = leerEstado(data).mode;
+        success(confirmado ? `Alarma armada — ${etiquetaTipo(confirmado)}` : 'Alarma armada');
+
         // "Alarma armada" a secas mientras el disparo está degradado es la
         // trampa que el modo prueba puede tender (CCE#122): el estado se
         // relee para poder decirlo acá mismo.
         try {
-          const { data } = await client.get('/config/alarm-armed');
-          avisarModoPrueba(data);
+          const { data: estado } = await client.get('/config/alarm-armed');
+          if (!confirmado) avisarTipo(estado);
+          avisarModoPrueba(estado);
         } catch {
           warn('No se pudo confirmar si el modo prueba está activo (`cce alarm status`)');
         }
@@ -58,6 +94,81 @@ export function registerAlarmCommand(program: Command): void {
         spinner.stop();
         fail((e as Error).message);
         process.exit(1);
+      }
+    });
+
+  cmd
+    .command('mode')
+    .argument(
+      '[tipo]',
+      "'perimetral' o 'total'; sin argumento sólo muestra el elegido",
+    )
+    .description('Tipo de alarma, sin armar ni desarmar (CCE#133)')
+    .action(async (tipo?: string) => {
+      const g = getGlobals(cmd);
+      const fmt = resolveFormat(g.format);
+      const client = createApiClient({ apiUrl: g.apiUrl });
+
+      if (tipo === undefined) {
+        try {
+          const { data } = await client.get('/config/alarm-armed');
+          const estado = leerEstado(data);
+          if (!estado.mode) {
+            fail('Esta API no conoce los tipos de alarma (actualizá el backend).');
+            process.exitCode = 1;
+            return;
+          }
+          printObject(
+            { mode: estado.mode, armed: estado.armed },
+            fmt === 'table' ? 'json' : fmt,
+          );
+          avisarTipo(data);
+        } catch (e) {
+          fail((e as Error).message);
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      const modo = parseTipo(tipo);
+      if (!modo) {
+        fail(
+          `Tipo desconocido: "${tipo}". Usá 'perimetral' o 'total' ` +
+            '(o nada para ver el elegido).',
+        );
+        process.exitCode = 1;
+        return;
+      }
+
+      const spinner = ora(`Cambiando a alarma ${etiquetaTipo(modo)}...`).start();
+      try {
+        const { data } = await client.put('/config/alarm-mode', { mode: modo });
+        spinner.stop();
+
+        // Una respuesta sin `mode` no confirma nada: decir «ahora es
+        // perimetral» sin que el backend lo haya guardado es prometer que el
+        // movimiento interior dejó de disparar cuando sigue disparando.
+        const confirmado = leerEstado(data).mode;
+        if (!confirmado) {
+          fail('El backend no confirmó el tipo de alarma (respuesta sin `mode`).');
+          process.exitCode = 1;
+          return;
+        }
+
+        const armed = await leerArmed(client);
+        success(`Tipo de alarma: ${etiquetaTipo(confirmado)}`);
+        // Cambiar el tipo NO arma ni desarma, y eso hay que decirlo: con la
+        // alarma armada cambió qué protege la casa AHORA; desarmada es sólo
+        // lo que se va a armar la próxima vez.
+        if (armed === true) {
+          warn(`La alarma sigue ARMADA y ahora protege: ${queProtege(confirmado)}`);
+        } else if (armed === false) {
+          warn(`La alarma sigue desarmada; al armarla va a proteger: ${queProtege(confirmado)}`);
+        }
+      } catch (e) {
+        spinner.stop();
+        fail((e as Error).message);
+        process.exitCode = 1;
       }
     });
 
@@ -178,14 +289,76 @@ function avisoModoPrueba(armed?: boolean): void {
   warn('Se apaga a mano con `cce alarm test-mode off`.');
 }
 
-/** Lee `{armed, testMode}` de la respuesta de `/config/alarm-armed`. */
-function leerEstado(data: unknown): { armed?: boolean; testMode: boolean } {
+/**
+ * El TIPO de alarma (CCE#133): qué protege cuando está armada.
+ *
+ * La alarma era un booleano y por eso casi no se usaba: con los 20 sensores
+ * marcados, armarla con gente adentro la hacía sonar en cuanto alguien cruzaba
+ * el pasillo. `perimeter` protege puertas y accesos; `total`, todo.
+ */
+type AlarmMode = 'perimeter' | 'total';
+
+/**
+ * Lo que el usuario escribe → el literal del contrato. `undefined` si no se
+ * entiende, y ahí NO se manda nada: adivinar es armar la casa protegiendo otra
+ * cosa de la que se pidió.
+ *
+ * Se aceptan las dos formas —la castellana, que es la que uno escribe, y la
+ * del contrato, que es la que aparece en el JSON de `status`—.
+ */
+function parseTipo(valor: string): AlarmMode | undefined {
+  const v = valor.toLowerCase().trim();
+  if (v === 'perimetral' || v === 'perimeter' || v === 'perimetro' || v === 'perímetro') {
+    return 'perimeter';
+  }
+  if (v === 'total') return 'total';
+  return undefined;
+}
+
+/** Cómo se nombra el tipo en un mensaje. */
+function etiquetaTipo(mode: AlarmMode): string {
+  return mode === 'perimeter' ? 'PERIMETRAL' : 'TOTAL';
+}
+
+/** Qué protege cada tipo, en una línea. «Perimetral» no dice nada por sí solo. */
+function queProtege(mode: AlarmMode): string {
+  return mode === 'perimeter'
+    ? 'sólo puertas y accesos (se puede estar adentro)'
+    : 'todo, incluido el movimiento adentro de casa';
+}
+
+/** Lee `{armed, mode, testMode}` de la respuesta de `/config/alarm-armed`. */
+function leerEstado(data: unknown): {
+  armed?: boolean;
+  mode?: AlarmMode;
+  testMode: boolean;
+} {
   if (!data || typeof data !== 'object') return { testMode: false };
-  const d = data as { armed?: unknown; testMode?: unknown };
+  const d = data as { armed?: unknown; mode?: unknown; testMode?: unknown };
   return {
     armed: typeof d.armed === 'boolean' ? d.armed : undefined,
+    // Ausente = una API vieja que no conoce los tipos. NO se asume `total`:
+    // inventar un tipo que nadie dijo es la forma de mentir sobre qué protege.
+    mode: d.mode === 'perimeter' || d.mode === 'total' ? d.mode : undefined,
     testMode: d.testMode === true,
   };
+}
+
+/**
+ * El TIPO, junto al estado (CCE#133). Va por STDERR como el aviso del modo
+ * prueba: `cce alarm status --format json | jq` sigue recibiendo JSON válido.
+ *
+ * Sólo con la alarma ARMADA se dice qué protege AHORA; desarmada alcanza con
+ * decir cuál se va a armar, sin gritar.
+ */
+function avisarTipo(data: unknown): void {
+  const estado = leerEstado(data);
+  if (!estado.mode) return;
+  if (estado.armed === true) {
+    warn(`Alarma ${etiquetaTipo(estado.mode)}: protege ${queProtege(estado.mode)}.`);
+  } else {
+    warn(`Tipo elegido: ${etiquetaTipo(estado.mode)} (al armarla protege ${queProtege(estado.mode)}).`);
+  }
 }
 
 /**

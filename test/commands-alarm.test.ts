@@ -27,6 +27,12 @@ interface Call {
 class FakeAlarmApi {
   armed = false;
   testMode = false;
+  /** El TIPO de alarma (CCE#133). `null` = backend viejo: no lo conoce. */
+  mode: 'perimeter' | 'total' | null = 'total';
+  /** El PUT del tipo contesta 200 SIN `mode`. */
+  omitModeResponse = false;
+  /** El PUT del tipo revienta. */
+  failModePut = false;
   /** El backend contesta 200 con OTRO valor del que se pidió. */
   forceEnabledResponse: boolean | null = null;
   /** El backend contesta 200 sin el campo `enabled`. */
@@ -51,11 +57,32 @@ class FakeAlarmApi {
         };
 
         if (path === '/api/config/alarm-armed' && method === 'GET') {
-          return reply(200, { armed: this.armed, testMode: this.testMode });
+          return reply(200, {
+            armed: this.armed,
+            ...(this.mode ? { mode: this.mode } : {}),
+            testMode: this.testMode,
+          });
         }
         if (path === '/api/config/alarm-armed' && method === 'PUT') {
-          this.armed = (body as { armed: boolean }).armed;
-          return reply(200, { success: true, armed: this.armed });
+          const b = body as { armed: boolean; mode?: 'perimeter' | 'total' };
+          this.armed = b.armed;
+          // Igual que la API: `mode` es OPCIONAL y sin él se arma el elegido.
+          if (b.mode && this.mode !== null) this.mode = b.mode;
+          return reply(200, {
+            success: true,
+            armed: this.armed,
+            ...(this.mode ? { mode: this.mode } : {}),
+          });
+        }
+        if (path === '/api/config/alarm-mode' && method === 'PUT') {
+          if (this.failModePut) return reply(500, { message: 'boom', statusCode: 500 });
+          const m = (body as { mode?: unknown } | undefined)?.mode;
+          if (m !== 'perimeter' && m !== 'total') {
+            return reply(400, { message: 'mode must be one of the following values', statusCode: 400 });
+          }
+          this.mode = m;
+          if (this.omitModeResponse) return reply(200, { success: true });
+          return reply(200, { success: true, mode: this.mode });
         }
         if (path === '/api/config/alarm-test-mode' && method === 'GET') {
           return reply(200, { enabled: this.testMode });
@@ -299,4 +326,220 @@ test('disarm no se mete con el modo prueba: son cosas distintas', async () => {
   assert.deepEqual(puts(), [
     { method: 'PUT', path: '/api/config/alarm-armed', body: { armed: false } },
   ]);
+});
+
+// ── CCE#133: el TIPO de alarma ────────────────────────────────────────────
+//
+// La alarma era un booleano y por eso casi no se usaba. Ahora se arma
+// perimetral o total, y el CLI es la vía más rápida para las dos cosas — y
+// también la vía por la que alguien puede armar el tipo equivocado sin darse
+// cuenta. Lo que se fija acá es que el CLI lo DIGA, y que `cce alarm arm` a
+// secas siga significando exactamente lo mismo que antes.
+
+test('arm SIN tipo no manda `mode`: arma el elegido, como Siri y las escenas', async () => {
+  api.mode = 'perimeter';
+
+  const { out, exitCode } = await run('alarm', 'arm');
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(puts(), [
+    { method: 'PUT', path: '/api/config/alarm-armed', body: { armed: true } },
+  ]);
+  assert.equal(api.armed, true);
+  assert.equal(api.mode, 'perimeter', 'armar sin tipo no puede cambiar el elegido');
+  assert.match(out, /Alarma armada — PERIMETRAL/);
+});
+
+test('arm perimetral arma en perimetral y lo deja elegido', async () => {
+  api.mode = 'total';
+
+  const { out, exitCode } = await run('alarm', 'arm', 'perimetral');
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(puts(), [
+    {
+      method: 'PUT',
+      path: '/api/config/alarm-armed',
+      body: { armed: true, mode: 'perimeter' },
+    },
+  ]);
+  assert.equal(api.armed, true);
+  assert.equal(api.mode, 'perimeter');
+  assert.match(out, /Alarma armada — PERIMETRAL/);
+});
+
+test('arm total también, y acepta el literal del contrato', async () => {
+  api.mode = 'perimeter';
+
+  await run('alarm', 'arm', 'total');
+  assert.equal(api.mode, 'total');
+
+  api.calls.length = 0;
+  await run('alarm', 'arm', 'perimeter');
+  assert.deepEqual(puts(), [
+    {
+      method: 'PUT',
+      path: '/api/config/alarm-armed',
+      body: { armed: true, mode: 'perimeter' },
+    },
+  ]);
+});
+
+test('un tipo que no se entiende NO se manda', async () => {
+  api.mode = 'total';
+
+  const { out, exitCode } = await run('alarm', 'arm', 'perimetal');
+
+  assert.equal(exitCode, 1);
+  assert.deepEqual(puts(), [], 'adivinar acá es armar la casa protegiendo otra cosa');
+  assert.equal(api.armed, false, 'y sobre todo: NO se armó');
+  assert.match(out, /Tipo desconocido/);
+  assert.match(out, /perimetral/);
+});
+
+test('status dice el tipo, no sólo si está armada', async () => {
+  api.armed = true;
+  api.mode = 'perimeter';
+
+  const { out } = await run('alarm', 'status');
+
+  assert.match(out, /"mode": "perimeter"/, 'el JSON lo trae para scripts');
+  assert.match(out, /Alarma PERIMETRAL/);
+  assert.match(out, /puertas y accesos/, '«perimetral» no significa nada por sí solo');
+});
+
+test('status desarmada dice cuál se va a armar, sin gritar', async () => {
+  api.armed = false;
+  api.mode = 'total';
+
+  const { out } = await run('alarm', 'status');
+
+  assert.match(out, /Tipo elegido: TOTAL/);
+  assert.doesNotMatch(out, /Alarma TOTAL: protege/, 'desarmada no protege nada todavía');
+});
+
+test('contra una API vieja, status no inventa un tipo', async () => {
+  api.armed = true;
+  api.mode = null; // backend sin CCE#133
+
+  const { out, exitCode } = await run('alarm', 'status');
+
+  assert.equal(exitCode, 0);
+  assert.doesNotMatch(out, /PERIMETRAL|TOTAL/, 'sin `mode` no hay tipo que declarar');
+  assert.match(out, /"armed": true/, 'y el resto se sigue leyendo igual');
+});
+
+test('arm contra una API vieja dice "Alarma armada" a secas', async () => {
+  api.mode = null;
+
+  const { out, exitCode } = await run('alarm', 'arm');
+
+  assert.equal(exitCode, 0);
+  assert.match(out, /Alarma armada/);
+  assert.doesNotMatch(out, /—\s*(PERIMETRAL|TOTAL)/);
+});
+
+test('mode sin argumento muestra el elegido y no escribe nada', async () => {
+  api.armed = false;
+  api.mode = 'perimeter';
+
+  const { out, exitCode } = await run('alarm', 'mode');
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(puts(), [], 'leer no escribe');
+  assert.match(out, /"mode": "perimeter"/);
+  assert.match(out, /Tipo elegido: PERIMETRAL/);
+});
+
+test('mode total cambia el tipo SIN armar ni desarmar', async () => {
+  api.armed = true;
+  api.mode = 'perimeter';
+
+  const { out, exitCode } = await run('alarm', 'mode', 'total');
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(puts(), [
+    { method: 'PUT', path: '/api/config/alarm-mode', body: { mode: 'total' } },
+  ]);
+  assert.equal(api.mode, 'total');
+  assert.equal(api.armed, true, 'cambiar el tipo no desarma la casa');
+  assert.match(out, /Tipo de alarma: TOTAL/);
+  assert.match(out, /sigue ARMADA y ahora protege/);
+});
+
+test('mode con la alarma desarmada no promete que ya protege', async () => {
+  api.armed = false;
+  api.mode = 'total';
+
+  const { out } = await run('alarm', 'mode', 'perimetral');
+
+  assert.equal(api.armed, false);
+  assert.match(out, /sigue desarmada/);
+  assert.doesNotMatch(out, /sigue ARMADA/);
+});
+
+test('mode con un tipo que no se entiende no manda nada', async () => {
+  api.mode = 'total';
+
+  const { out, exitCode } = await run('alarm', 'mode', 'parcial');
+
+  assert.equal(exitCode, 1);
+  assert.deepEqual(puts(), []);
+  assert.equal(api.mode, 'total');
+  assert.match(out, /Tipo desconocido/);
+});
+
+test('una respuesta sin `mode` no confirma nada: sale con error', async () => {
+  api.armed = true;
+  api.mode = 'total';
+  api.omitModeResponse = true;
+
+  const { out, exitCode } = await run('alarm', 'mode', 'perimetral');
+
+  assert.equal(exitCode, 1);
+  assert.match(out, /no confirmó el tipo/);
+});
+
+test('si el PUT del tipo falla, sale con exitCode y no con process.exit', async () => {
+  api.failModePut = true;
+
+  const { exitCode } = await run('alarm', 'mode', 'perimetral');
+
+  assert.equal(exitCode, 1);
+});
+
+test('mode contra una API vieja lo dice en vez de mostrar la nada', async () => {
+  api.mode = null;
+
+  const { out, exitCode } = await run('alarm', 'mode');
+
+  assert.equal(exitCode, 1);
+  assert.match(out, /no conoce los tipos de alarma/);
+});
+
+test('el tipo y el modo prueba conviven: los DOS avisos salen', async () => {
+  // El riesgo que el issue nombra por su nombre: ahora hay dos cosas que se
+  // llaman «modo». Si alguien cree que armó en total y estaba en modo prueba,
+  // la alarma no suena — los dos hechos tienen que estar a la vista.
+  api.armed = true;
+  api.mode = 'perimeter';
+  api.testMode = true;
+
+  const { out } = await run('alarm', 'status');
+
+  assert.match(out, /Alarma PERIMETRAL/);
+  assert.match(out, /MODO PRUEBA ACTIVO/);
+});
+
+test('disarm no se mete con el tipo: queda elegido para la próxima', async () => {
+  api.armed = true;
+  api.mode = 'perimeter';
+
+  const { exitCode } = await run('alarm', 'disarm');
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(puts(), [
+    { method: 'PUT', path: '/api/config/alarm-armed', body: { armed: false } },
+  ]);
+  assert.equal(api.mode, 'perimeter');
 });
