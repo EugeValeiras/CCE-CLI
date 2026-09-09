@@ -44,7 +44,18 @@ export interface DeviceBinding {
   identifier?: string;
   capabilities: DeviceCapability[];
   available: boolean;
-  lastSeen: number;
+  /**
+   * Cuándo la API armó su lista de devices, NO cuándo se supo algo de este
+   * binding. Se llamaba `lastSeen` y no era eso: el merge lo sella con la hora
+   * del rebuild —hay uno por minuto— para todos los bindings presentes, uno
+   * caído incluido, así que decía «hace un minuto» de uno que llevaba días
+   * mudo (CCE#154). Medido contra la casa: los 137 bindings de los 76 devices
+   * traían el MISMO milisegundo, los dos caídos entre ellos.
+   *
+   * Para «¿hace cuánto está caído?» este número no sirve; la señal que haría
+   * falta todavía no existe en el backend.
+   */
+  lastRebuiltAt: number;
   priority: number;
 }
 
