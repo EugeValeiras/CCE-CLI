@@ -279,3 +279,103 @@ export interface EventsListResponse {
   nextCursor: string | null;
   enabled: boolean;
 }
+
+// ── Métricas de la Pi (EugeValeiras/CCE#174) ─────────────────────────────────
+// Copiado de `CCE-API/src/system/system-metrics.types.ts`: la forma de
+// `GET /api/system/metrics` y del evento `metrics:sample`. Todo lo que sale de
+// `/proc` o `/sys` es NULLABLE (una API fuera de Linux responde
+// `available: false` con esos bloques en `null`).
+
+export type ThrottleFlag = 'under-voltage' | 'freq-capped' | 'throttled' | 'soft-temp-limit';
+
+export interface ThrottledState {
+  raw: number;
+  /** Lo que pasa AHORA. Vacío = todo bien. */
+  active: ThrottleFlag[];
+  /** Lo que pasó alguna vez desde el arranque del host. */
+  occurred: ThrottleFlag[];
+}
+
+export interface CpuMetrics {
+  /** 0-100, delta de `/proc/stat` contra la muestra anterior. */
+  usagePct: number | null;
+  perCore: number[] | null;
+  load1: number;
+  load5: number;
+  load15: number;
+  tempC: number | null;
+  throttled: ThrottledState | null;
+}
+
+export interface MemMetrics {
+  totalBytes: number;
+  /** `MemTotal - MemAvailable`. */
+  usedBytes: number;
+  /** `MemAvailable`: lo que mira el OOM killer. */
+  availableBytes: number;
+  swapTotalBytes: number;
+  swapUsedBytes: number;
+}
+
+export interface DiskUsage {
+  mount: string;
+  device: string;
+  totalBytes: number;
+  usedBytes: number;
+  availableBytes: number;
+  /** El `Use%` de `df`. */
+  usedPct: number;
+}
+
+export interface DiskIo {
+  /** El disco entero: `mmcblk0`, `nvme0n1`. */
+  device: string;
+  readBytesPerSec: number;
+  writeBytesPerSec: number;
+  readOpsPerSec: number;
+  writeOpsPerSec: number;
+}
+
+export interface NetIo {
+  iface: string;
+  rxBytesPerSec: number;
+  txBytesPerSec: number;
+}
+
+export interface ProcessMetrics {
+  rssBytes: number;
+  heapUsedBytes: number;
+  heapTotalBytes: number;
+  /** p99 del retraso del event loop en el intervalo, en ms. */
+  eventLoopLagMs: number;
+}
+
+export interface MetricsSample {
+  /** Epoch ms. La clave de `?after=`. */
+  sampledAt: number;
+  cpu: CpuMetrics;
+  mem: MemMetrics | null;
+  disk: DiskUsage[] | null;
+  io: DiskIo[] | null;
+  net: NetIo[] | null;
+  process: ProcessMetrics;
+  uptime: { hostSec: number; processSec: number };
+}
+
+export interface HostInfo {
+  hostname: string;
+  cores: number;
+  arch: string;
+  kernel: string;
+  platform: string;
+}
+
+export interface SystemMetricsResponse {
+  available: boolean;
+  intervalMs: number;
+  retainedMinutes: number;
+  host: HostInfo;
+  /** `null` sólo antes de la primera muestra (los primeros 5 s de la API). */
+  current: MetricsSample | null;
+  history: MetricsSample[];
+}
