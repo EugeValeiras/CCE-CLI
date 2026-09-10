@@ -265,6 +265,21 @@ cce events live --json | jq .
 Eventos: `light:changed`, `device:state-changed`, `automation:executed`,
 `alarm:armed-changed`, `alarm:triggered`.
 
+### `system`
+
+Métricas de la Raspberry Pi (EugeValeiras/CCE#174): CPU, temperatura, memoria,
+discos, I/O, red y el proceso de la API. Es lo que se mira después de un
+deploy sin abrir la consola web.
+
+```bash
+cce system                    # una tabla con el «ahora»
+cce system --format json      # el payload crudo de GET /api/system/metrics
+cce system --watch            # refresca con cada muestra (5 s); Ctrl-C para salir
+```
+
+Necesita `CCE_API_TOKEN`: el endpoint y el vivo van siempre con token. Contra
+una API anterior a CCE#174 falla con un mensaje claro (404), no con un stack.
+
 ## Flags globales
 
 - `--api-url <url>` — override del base URL (equivale a `CCE_API_URL`).

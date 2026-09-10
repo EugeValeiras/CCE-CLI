@@ -12,12 +12,13 @@ import { registerGroupsCommand } from '../commands/groups.js';
 import { registerNotifyCommand } from '../commands/notify.js';
 import { registerJblCommand } from '../commands/jbl.js';
 import { registerTvCommand } from '../commands/tv.js';
+import { registerSystemCommand } from '../commands/system.js';
 
 const program = new Command();
 
 program
   .name('cce')
-  .description('CLI para CCE — Control de Casa (devices, scan, hue, automations, config, events)')
+  .description('CLI para CCE — Control de Casa (devices, scan, hue, automations, config, events, system)')
   .version('0.1.0')
   .option('--api-url <url>', 'URL de la API CCE (default: http://localhost:3000 o $CCE_API_URL)')
   .option('--format <format>', 'Formato de salida: table | json | csv', 'table');
@@ -34,6 +35,7 @@ registerTvCommand(program);
 registerAutomationsCommand(program);
 registerConfigCommand(program);
 registerEventsCommand(program);
+registerSystemCommand(program);
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(err.message ?? err);
